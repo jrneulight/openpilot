@@ -139,7 +139,9 @@ class CarController(CarControllerBase, LateralCurvExt, LateralAngleExt, Longitud
     # BluePilot: keep stock lateral path in carcontroller, and run BP 4-signal lateral
     # only when bypass is disabled.
     if (self.frame % CarControllerParams.STEER_STEP) == 0:
-      current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
+      # BluePilot: pinion-angle sourced measurement (LateralCurvExt.get_current_curvature);
+      # yaw-rate is untrusted on vehicles with a faulty RCM yaw sensor.
+      current_curvature = self.get_current_curvature(CS)
       # BluePilot: bypass flag is owned by stock carcontroller path.
       bypass_bp_lat = self.disable_BP_lat_UI
       if bypass_bp_lat:

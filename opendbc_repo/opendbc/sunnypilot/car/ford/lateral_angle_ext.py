@@ -418,7 +418,7 @@ class LateralAngleExt:
     # Use planner / predicted κ directly for the κ → path_angle map; we are not sending κ on CAN.
     kappa_cmd = float(requested_curvature)
 
-    # BluePilot: clip kappa_cmd to current_curvature (measured, from yaw rate) +- CURVATURE_ERROR,
+    # BluePilot: clip kappa_cmd to current_curvature (measured) +- CURVATURE_ERROR,
     # mirroring lateral_curv_ext.py's apply_ford_curvature_limits_ext exactly (same formula, same
     # v_ego > 9 gate, same CarControllerParams.CURVATURE_ERROR tolerance). Without this, kappa_cmd
     # (and therefore path_angle, and the shadow_curvature sent to ford.h) can legitimately lead the
@@ -427,7 +427,10 @@ class LateralAngleExt:
     # routinely, not just on genuine pothole/override divergence. Curvature mode has always clipped
     # here; this brings angle mode's actual steering intent in line with that proven behavior rather
     # than only clipping the value reported to panda (which would make the check a no-op).
-    current_curvature = -CS.out.yawRate / max(v_ego, 0.1)
+    # Measurement is pinion-angle sourced (LateralCurvExt.get_current_curvature via CarController
+    # MRO); yaw-rate is untrusted on vehicles with a faulty RCM yaw sensor. Also feeds the
+    # stall-blip detector's _stall_gap below.
+    current_curvature = self.get_current_curvature(CS)
     self.bp_curvature_deviation_limited = False
     if v_ego > 9:
       _kappa_cmd_pre_error_clip = kappa_cmd

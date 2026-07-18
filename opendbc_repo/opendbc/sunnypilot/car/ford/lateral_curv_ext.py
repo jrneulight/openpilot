@@ -15,6 +15,7 @@ A detailed explanation of Ford's control protocol:
 https://www.f150gen14.com/forum/threads/introducing-bluepilot-a-ford-specific-fork-for-comma3x-openpilot.24241/#post-457706
 """
 
+import math
 from collections import namedtuple, deque
 from enum import IntEnum
 
@@ -246,6 +247,23 @@ class LateralCurvExt:
       sr = max(self.lp.steerRatio, 0.1)
       self.VM.update_params(x, sr)
 
+  def get_current_curvature(self, CS):
+    """Measured curvature from the steering pinion angle via the vehicle model.
+
+    BluePilot: the yaw-rate-based measurement (-CS.out.yawRate / v) is NOT used because
+    some vehicles (e.g. a 2021 Explorer with a faulty RCM) broadcast implausible
+    VehYaw_W_Actl (sign-inverted vs IMU and steering geometry) while its CAN quality
+    flag still reads OK. The pinion angle (SteeringPinion_Data, PSCM) is an equivalent
+    measurement, independently validated against the comma IMU (corr +0.99); the panda
+    safety angle_meas uses the same source (see safety/modes/ford.h).
+    angleOffsetDeg/roll come from liveParameters (paramsd, IMU-derived - not the car
+    yaw sensor). Sign convention matches latcontrol_torque.py.
+    """
+    angle_offset_deg = self.lp.angleOffsetDeg if self.lp is not None else 0.0
+    roll = self.lp.roll if self.lp is not None else 0.0
+    return -self.VM.calc_curvature(math.radians(CS.out.steeringAngleDeg - angle_offset_deg),
+                                   CS.out.vEgoRaw, roll)
+
   def update(self, CC, CS, actuators, apply_curvature_last, CP):
     """
     Compute lateral steering signals for the current frame.
@@ -284,8 +302,8 @@ class LateralCurvExt:
 
       self.pc_blend_ratio_v = [self.pc_blend_ratio_low_C, self.pc_blend_ratio_high_C]
 
-      # Current and desired curvature
-      current_curvature = -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
+      # Current and desired curvature (pinion-angle sourced; see get_current_curvature)
+      current_curvature = self.get_current_curvature(CS)
       desired_curvature = actuators.curvature
 
       # Extract predicted curvature from modelV2
