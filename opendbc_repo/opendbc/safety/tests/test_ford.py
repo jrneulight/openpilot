@@ -78,8 +78,13 @@ class TestFordSafetyBase(common.CarSafetyTest):
   # Curvature control limits
   DEG_TO_CAN = 50000  # 1 / (2e-5) rad to can
   MAX_CURVATURE = 0.02
-  MAX_CURVATURE_ERROR = 0.002
+  MAX_CURVATURE_ERROR = 0.003  # BluePilot: widened from 0.002 (pinion-sourced angle_meas has no roll/offset compensation)
   CURVATURE_ERROR_MIN_SPEED = 10.0  # m/s
+
+  # BluePilot: pinion-angle -> curvature conversion (must match FORD_EXPLORER_PINION_PARAMS in modes/ford.h)
+  PINION_SLIP_FACTOR = -0.0005544735
+  PINION_STEER_RATIO = 16.8
+  PINION_WHEELBASE = 3.025
 
   ANGLE_RATE_BP = [5., 25., 25.]
   ANGLE_RATE_UP = [0.00045, 0.0001, 0.0001]  # windup limit
@@ -88,6 +93,7 @@ class TestFordSafetyBase(common.CarSafetyTest):
   cnt_speed = 0
   cnt_speed_2 = 0
   cnt_yaw_rate = 0
+  cnt_pinion = 0
 
   packer: CANPackerSafety
   safety: libsafety_py.LibSafety
@@ -103,10 +109,29 @@ class TestFordSafetyBase(common.CarSafetyTest):
     t = round(t * self.DEG_TO_CAN)
     self.safety.set_desired_angle_last(t)
 
+  def _curvature_to_pinion_angle_deg(self, curvature: float, speed: float) -> float:
+    # Inverse of the firmware conversion in ford_rx_hook (modes/ford.h):
+    # curvature = angle_rad * curvature_factor(speed) / steer_ratio
+    speed = max(speed, 0.1)
+    curvature_factor = 1. / (1. - (self.PINION_SLIP_FACTOR * (speed ** 2))) / self.PINION_WHEELBASE
+    angle_rad = curvature * self.PINION_STEER_RATIO / curvature_factor
+    return float(np.degrees(angle_rad))
+
+  # Current curvature measurement (BluePilot: pinion-angle sourced, not yaw)
+  def _pinion_msg(self, curvature: float, speed: float, quality_flag=True):
+    values = {"StePinComp_An_Est": self._curvature_to_pinion_angle_deg(curvature, speed),
+              "StePinCompAnEst_D_Qf": 3 if quality_flag else 0,
+              "StePinAn_No_Cnt": self.cnt_pinion % 16}
+    self.__class__.cnt_pinion += 1
+    return self.packer.make_can_msg_safety("SteeringPinion_Data", 0, values)
+
   def _reset_curvature_measurement(self, curvature, speed):
-    for _ in range(6):
+    # 14 frames, not 6: frames after a counter discontinuity (e.g. rejected bad-QF frames
+    # advanced the python-side counter) are dropped by the rx counter check until it
+    # re-syncs, which would otherwise leave stale samples in the 6-deep angle_meas buffer
+    for _ in range(14):
       self._rx(self._speed_msg(speed))
-      self._rx(self._yaw_rate_msg(curvature, speed))
+      self._rx(self._pinion_msg(curvature, speed))
 
   # Driver brake pedal
   def _user_brake_msg(self, brake: bool):
@@ -214,7 +239,7 @@ class TestFordSafetyBase(common.CarSafetyTest):
   def test_rx_hook(self):
     # checksum, counter, and quality flag checks
     for quality_flag in [True, False]:
-      for msg_type in ["speed", "speed_2", "yaw"]:
+      for msg_type in ["speed", "speed_2", "yaw", "pinion"]:
         self.safety.set_controls_allowed(True)
         # send multiple times to verify counter checks
         for _ in range(10):
@@ -224,34 +249,98 @@ class TestFordSafetyBase(common.CarSafetyTest):
             msg = self._speed_msg_2(0, quality_flag=quality_flag)
           elif msg_type == "yaw":
             msg = self._yaw_rate_msg(0, 0, quality_flag=quality_flag)
+          elif msg_type == "pinion":
+            msg = self._pinion_msg(0, 0, quality_flag=quality_flag)
 
           self.assertEqual(quality_flag, self._rx(msg))
           self.assertEqual(quality_flag, self.safety.get_controls_allowed())
 
-        # Mess with checksum to make it fail, checksum is not checked for 2nd speed
-        msg[0].data[3] = 0  # Speed checksum & half of yaw signal
-        should_rx = msg_type == "speed_2" and quality_flag
+        # Mess with checksum to make it fail; checksum is not checked for 2nd speed or pinion
+        # (pinion has an unknown OEM checksum algorithm; integrity is via counter + quality flag)
+        msg[0].data[3] = 0  # Speed checksum & half of yaw/pinion angle signal
+        should_rx = msg_type in ("speed_2", "pinion") and quality_flag
         self.assertEqual(should_rx, self._rx(msg))
         self.assertEqual(should_rx, self.safety.get_controls_allowed())
 
   def test_angle_measurements(self):
-    """Tests rx hook correctly parses the curvature measurement from the vehicle speed and yaw rate"""
+    """Tests rx hook correctly parses the curvature measurement from the steering pinion angle.
+
+    BluePilot: angle_meas is pinion-sourced (SteeringPinion_Data), not yaw-rate. The DBC signal
+    quantizes to 0.1 deg, so allow 1 CAN-unit tolerance from the round trip through the packer.
+    """
     for speed in np.arange(0.5, 40, 0.5):
       for curvature in np.arange(0, self.MAX_CURVATURE * 2, 2e-3):
         self._rx(self._speed_msg(speed))
         for c in (curvature, -curvature, 0, 0, 0, 0):
-          self._rx(self._yaw_rate_msg(c, speed))
+          self._rx(self._pinion_msg(c, speed))
 
-        self.assertEqual(self.safety.get_angle_meas_min(), round(-curvature * self.DEG_TO_CAN))
-        self.assertEqual(self.safety.get_angle_meas_max(), round(curvature * self.DEG_TO_CAN))
+        quant_tol = self._pinion_quant_tol(speed)
+        self.assertAlmostEqual(self.safety.get_angle_meas_min(), round(-curvature * self.DEG_TO_CAN), delta=quant_tol)
+        self.assertAlmostEqual(self.safety.get_angle_meas_max(), round(curvature * self.DEG_TO_CAN), delta=quant_tol)
 
-        self._rx(self._yaw_rate_msg(0, speed))
-        self.assertEqual(self.safety.get_angle_meas_min(), round(-curvature * self.DEG_TO_CAN))
-        self.assertEqual(self.safety.get_angle_meas_max(), 0)
+        self._rx(self._pinion_msg(0, speed))
+        self.assertAlmostEqual(self.safety.get_angle_meas_min(), round(-curvature * self.DEG_TO_CAN), delta=quant_tol)
+        self.assertAlmostEqual(self.safety.get_angle_meas_max(), 0, delta=quant_tol)
 
-        self._rx(self._yaw_rate_msg(0, speed))
-        self.assertEqual(self.safety.get_angle_meas_min(), 0)
-        self.assertEqual(self.safety.get_angle_meas_max(), 0)
+        self._rx(self._pinion_msg(0, speed))
+        self.assertAlmostEqual(self.safety.get_angle_meas_min(), 0, delta=quant_tol)
+        self.assertAlmostEqual(self.safety.get_angle_meas_max(), 0, delta=quant_tol)
+
+  def _pinion_quant_tol(self, speed: float) -> int:
+    # 0.1 deg DBC quantization -> curvature CAN units at this speed (+1 for float rounding)
+    speed = max(speed, 0.1)
+    curvature_factor = 1. / (1. - (self.PINION_SLIP_FACTOR * (speed ** 2))) / self.PINION_WHEELBASE
+    return int(np.radians(0.1) * curvature_factor / self.PINION_STEER_RATIO * self.DEG_TO_CAN) + 2
+
+  def test_pinion_quality_flag_gates_measurement(self):
+    """BluePilot: a bad pinion quality flag must reject the message (measurement not updated)."""
+    speed = self.CURVATURE_ERROR_MIN_SPEED + 5
+    self._reset_curvature_measurement(0.005, speed)
+    meas_max_before = self.safety.get_angle_meas_max()
+    self.assertGreater(meas_max_before, 0)
+
+    # bad-QF frames must be rejected at rx and leave angle_meas untouched
+    for _ in range(6):
+      self.assertFalse(self._rx(self._pinion_msg(0, speed, quality_flag=False)))
+    self.assertEqual(self.safety.get_angle_meas_max(), meas_max_before)
+
+  def _drain_reset_bypass_latch(self, curvature, speed):
+    # ford.h arms a 60-frame bypass latch whenever a curvature==0 && path_angle==0 frame is
+    # sent (human-turn ramp-up support). Prior tests commonly end on zeroed commands, so the
+    # latch may be live. Drain it with >60 nonzero-curvature frames (each decrements it),
+    # keeping the command at the measured curvature so nothing else violates meanwhile.
+    self.safety.set_controls_allowed(True)
+    for _ in range(70):
+      self._set_prev_desired_angle(curvature)
+      self._tx(self._lat_ctl_msg(True, 0, 0, curvature, 0))
+      self.safety.set_controls_allowed(True)
+
+  def test_pinion_sign_convention(self):
+    """BluePilot: command matching the measured curvature sign passes the error check;
+    a sign-inverted command (the broken-yaw failure mode) violates above the gate speed."""
+    speed = self.CURVATURE_ERROR_MIN_SPEED + 5
+    curvature = 0.005  # well above MAX_CURVATURE_ERROR so the inverted case must violate
+
+    for sign in (1, -1):
+      with self.subTest(sign=sign):
+        self._reset_curvature_measurement(sign * curvature, speed)
+        self._drain_reset_bypass_latch(sign * curvature, speed)
+        self._set_prev_desired_angle(sign * curvature)
+        # matching-sign command: allowed
+        self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0, sign * curvature, 0)))
+        # inverted command (what a sign-flipped sensor would demand): blocked
+        self._set_prev_desired_angle(-sign * curvature)
+        self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0, -sign * curvature, 0)))
+
+  def test_pinion_check_inert_below_gate_speed(self):
+    """BluePilot: below CURVATURE_ERROR_MIN_SPEED the deviation check must not constrain commands."""
+    self.safety.set_controls_allowed(True)
+    speed = self.CURVATURE_ERROR_MIN_SPEED - 2
+    self._reset_curvature_measurement(0.005, speed)
+    # command far from measured, but below gate: allowed (rate limits still apply, so seed prev)
+    inverted = -0.005
+    self._set_prev_desired_angle(inverted)
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0, inverted, 0)))
 
   def test_max_lateral_acceleration(self):
     # Ford CAN FD can achieve a higher max lateral acceleration than CAN so we limit curvature based on speed

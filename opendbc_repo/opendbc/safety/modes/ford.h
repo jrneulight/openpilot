@@ -9,6 +9,7 @@
 #define FORD_BrakeSysFeatures      0x415U   // RX from ABS, for vehicle speed
 #define FORD_EngVehicleSpThrottle2 0x202U   // RX from PCM, for second vehicle speed
 #define FORD_Yaw_Data_FD1          0x91U    // RX from RCM, for yaw rate
+#define FORD_SteeringPinion_Data   0x7EU    // RX from PSCM, for steering pinion angle (angle_meas source)
 #define FORD_Steering_Data_FD1     0x083U   // TX by OP, various driver switches and LKAS/CC buttons
 #define FORD_ACCDATA               0x186U   // TX by OP, ACC controls
 #define FORD_ACCDATA_3             0x18AU   // TX by OP, ACC/TJA user interface
@@ -29,6 +30,9 @@ static uint8_t ford_get_counter(const CANPacket_t *msg) {
   } else if (msg->addr == FORD_Yaw_Data_FD1) {
     // Signal: VehRollYaw_No_Cnt
     cnt = msg->data[5];
+  } else if (msg->addr == FORD_SteeringPinion_Data) {
+    // Signal: StePinAn_No_Cnt (47|4@0+; verified against CANParser on real frames)
+    cnt = (msg->data[5] >> 4) & 0xFU;
   } else {
   }
   return cnt;
@@ -74,6 +78,8 @@ static bool ford_get_quality_flag_valid(const CANPacket_t *msg) {
     valid = ((msg->data[4] >> 5) & 0x3U) == 0x3U;  // VehVActlEng_D_Qf
   } else if (msg->addr == FORD_Yaw_Data_FD1) {
     valid = ((msg->data[6] >> 4) & 0x3U) == 0x3U;  // VehYawWActl_D_Qf
+  } else if (msg->addr == FORD_SteeringPinion_Data) {
+    valid = ((msg->data[5] >> 2) & 0x3U) == 0x3U;  // StePinCompAnEst_D_Qf (3=OK; verified on real frames)
   } else {
   }
   return valid;
@@ -109,7 +115,10 @@ static bool ford_get_quality_flag_valid(const CANPacket_t *msg) {
 #define FORD_LIMITS(limit_lateral_acceleration) {                                               \
   .max_angle = 1000,          /* 0.02 curvature */                                              \
   .angle_deg_to_can = 50000,  /* 1 / (2e-5) rad to can */                                       \
-  .max_angle_error = 100,     /* 0.002 * FORD_STEERING_LIMITS.angle_deg_to_can */               \
+  .max_angle_error = 150,     /* 0.003 * angle_deg_to_can; BluePilot: widened from 100 (0.002) \
+                                 because pinion-sourced angle_meas has no roll/alignment-offset \
+                                 compensation in firmware (Python layer compensates via         \
+                                 liveParameters; firmware uses raw pinion angle) */             \
   /* Looser symmetric ROCs (former down table); Python control uses stricter up row in values_ext */ \
   .angle_rate_up_lookup = {                                                                     \
     {5., 16., 25.},                                                                             \
@@ -222,6 +231,16 @@ static const AngleSteeringLimits FORD_CURVATURE_RATE_LIMITS_CANFD = {
 };
 
 static const AngleSteeringLimits FORD_STEERING_LIMITS = FORD_LIMITS(false);
+
+// BluePilot: geometry for pinion-angle -> curvature conversion (angle_meas source).
+// FORK-ONLY: hardcoded for FORD_EXPLORER_MK6 (2021 Explorer). slip_factor computed via
+// calc_slip_factor(VehicleModel(Explorer CP)) = -5.545e-4; empirical fit from real routes
+// gave -4.97e-4 (agreement within tire-model tolerance). Tesla precedent: tesla.h.
+static const AngleSteeringParams FORD_EXPLORER_PINION_PARAMS = {
+  .slip_factor = -0.0005544735,
+  .steer_ratio = 16.8,
+  .wheelbase = 3.025,
+};
 
 
 
@@ -396,12 +415,25 @@ static void ford_rx_hook(const CANPacket_t *msg) {
       speed_mismatch_check(filtered_pcm_speed);
     }
 
-    // Update vehicle yaw rate
-    if (msg->addr == FORD_Yaw_Data_FD1) {
-      // Signal: VehYaw_W_Actl
-      // TODO: we should use the speed which results in the closest angle measurement to the desired angle
-      float ford_yaw_rate = (((msg->data[2] << 8U) | msg->data[3]) * 0.0002) - 6.5;
-      float current_curvature = ford_yaw_rate / SAFETY_MAX(vehicle_speed.values[0] / VEHICLE_SPEED_FACTOR, 0.1);
+    // Update measured curvature from the steering pinion angle (PSCM).
+    // BluePilot: the yaw-rate source (FORD_Yaw_Data_FD1 / VehYaw_W_Actl) is NOT used for
+    // angle_meas: some vehicles (e.g. 2021 Explorer with a faulty RCM) broadcast implausible
+    // yaw (sign-inverted vs IMU/steering geometry) while its quality flag still reads OK.
+    // The pinion angle was validated against the comma IMU (corr +0.99 on real routes).
+    // NOTE: geometry constants are hardcoded for FORD_EXPLORER_MK6 (fork-only change);
+    // slip_factor from calc_slip_factor(VehicleModel(Explorer CP)).
+    if (msg->addr == FORD_SteeringPinion_Data) {
+      // Signal: StePinComp_An_Est, 22|15@0+ (0.1,-1600) deg (extraction verified vs CANParser
+      // on 3000/3000 real frames)
+      int angle_raw = ((msg->data[2] & 0x7FU) << 8) | msg->data[3];
+      float pinion_angle_deg = (angle_raw * 0.1f) - 1600.0f;
+      float pinion_angle_rad = pinion_angle_deg * 0.017453292519943295f;  // DEG_TO_RAD
+      // angle -> curvature via vehicle model (matches VehicleModel.curvature_factor);
+      // sign: firmware angle_meas is Ford wire convention (yaw block used +yaw/v), and
+      // pinion angle correlates +0.97 with wire desired curvature on real frames -> positive.
+      float speed = SAFETY_MAX(vehicle_speed.values[0] / VEHICLE_SPEED_FACTOR, 0.1);
+      float curvature_factor = get_curvature_factor(speed, FORD_EXPLORER_PINION_PARAMS);
+      float current_curvature = pinion_angle_rad * curvature_factor / FORD_EXPLORER_PINION_PARAMS.steer_ratio;
       // convert current curvature into units on CAN for comparison with desired curvature
       update_sample(&angle_meas, ROUND(current_curvature * FORD_STEERING_LIMITS.angle_deg_to_can));
     }
@@ -800,6 +832,10 @@ static safety_config ford_init(uint16_t param) {
     // It has been confirmed that the Bronco Sport's camera only disallows ACC for bad quality flags, not counters or checksums, so we match that
     {.msg = {{FORD_EngVehicleSpThrottle2, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},
     {.msg = {{FORD_Yaw_Data_FD1, 0, 8, 100U, .max_counter = 255U}, { 0 }, { 0 }}},
+    // BluePilot: pinion angle (angle_meas source). Counter verified 0-15 on real frames.
+    // StePinAn_No_Cs checksum algorithm is unknown (Ford sum-invert patterns don't match
+    // real frames) -> ignore_checksum; integrity via counter + quality flag + 100Hz check.
+    {.msg = {{FORD_SteeringPinion_Data, 0, 8, 100U, .max_counter = 15U, .ignore_checksum = true}, { 0 }, { 0 }}},
     // These messages have no counter or checksum
     {.msg = {{FORD_EngBrakeData, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{FORD_EngVehicleSpThrottle, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
