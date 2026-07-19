@@ -15,6 +15,7 @@ A detailed explanation of Ford's control protocol:
 https://www.f150gen14.com/forum/threads/introducing-bluepilot-a-ford-specific-fork-for-comma3x-openpilot.24241/#post-457706
 """
 
+import math
 from collections import namedtuple, deque
 from enum import IntEnum
 
@@ -27,7 +28,7 @@ from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, DT_CTRL
 from opendbc.car.lateral import ISO_LATERAL_ACCEL, apply_std_steer_angle_limits
 from opendbc.car.vehicle_model import VehicleModel
 from opendbc.car.ford.values import CarControllerParams, FordFlags
-from opendbc.sunnypilot.car.ford.values_ext import BP_ANGLE_LIMITS, CURVATURE_MAX
+from opendbc.sunnypilot.car.ford.values_ext import BP_ANGLE_LIMITS, CURVATURE_MAX, FordSafetyFlagsSP
 from opendbc.sunnypilot.car.ford.human_turn import HumanTurnDetector
 from selfdrive.modeld.constants import ModelConstants
 
@@ -120,6 +121,14 @@ class LateralCurvExt:
 
     # Primary lateral control variable: consumed by CarController's lateral dispatch.
     self.primary_lateral_control = PrimaryLateralControl.curvature
+
+    # BluePilot: steering-angle curvature measurement (bad-yaw-sensor workaround).
+    # Mirrors the STEER_ANGLE_CURVATURE flag the safety firmware reads from
+    # current_safety_param_sp -- both layers must always agree, so this is init-time
+    # state from CP_SP (set by _initialize_ford at car init), never a live Params read:
+    # a live flip against stale firmware would fight the panda.
+    self.bp_pinion_curvature_enabled = bool(
+      CP_SP is not None and (CP_SP.safetyParam & FordSafetyFlagsSP.STEER_ANGLE_CURVATURE))
 
     # Toggles (updated from Params each frame)
     self.enable_human_turn_detection_curv = True
@@ -235,10 +244,26 @@ class LateralCurvExt:
 
     The single measurement source for every BluePilot lateral consumer: the deviation
     clip, the stall detector, and the shadow curvature published to ford.h's angle-mode
-    deviation check. Sourced from the RCM yaw rate -- the same family ford.h derives its
-    angle_meas from. The shadow value judged against that check must always come from
-    the same measurement as the check's own reference, so route all reads through here.
+    deviation check. The default source is the RCM yaw rate -- the same family stock
+    ford.h derives its angle_meas from. The shadow value judged against that check must
+    always come from the same measurement as the check's own reference, so route all
+    reads through here.
+
+    With the steering-angle curvature measurement enabled (FordPrefSteerAngleCurvature
+    toggle -> FordSafetyFlagsSP.STEER_ANGLE_CURVATURE), the pinion angle via the vehicle
+    model is used instead: some vehicles (e.g. a 2021 Explorer with a faulty RCM)
+    broadcast implausible VehYaw_W_Actl (sign-inverted vs IMU and steering geometry)
+    while its CAN quality flag still reads OK. The pinion angle (SteeringPinion_Data,
+    PSCM) is an equivalent measurement, independently validated against the comma IMU
+    (corr +0.99), and the panda safety angle_meas switches to the same source (see
+    safety/modes/ford.h) -- the layers always agree. angleOffsetDeg/roll come from
+    liveParameters (paramsd, IMU-derived, not the car yaw sensor).
     """
+    if self.bp_pinion_curvature_enabled:
+      angle_offset_deg = self.lp.angleOffsetDeg if self.lp is not None else 0.0
+      roll = self.lp.roll if self.lp is not None else 0.0
+      return -self.VM.calc_curvature(math.radians(CS.out.steeringAngleDeg - angle_offset_deg),
+                                     CS.out.vEgoRaw, roll)
     return -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
 
   def update_sm(self):

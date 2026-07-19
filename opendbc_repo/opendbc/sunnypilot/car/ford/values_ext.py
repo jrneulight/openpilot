@@ -9,6 +9,7 @@ from collections import namedtuple
 
 from opendbc.car import structs
 from opendbc.car.docs_definitions import CarParts, Device
+from opendbc.car.ford.values import CAR
 from opendbc.car.lateral import AngleSteeringLimits
 
 ButtonType = structs.CarState.ButtonEvent.Type
@@ -39,6 +40,44 @@ BUTTONS = [
   # Main cruise button (on/off toggle)
   Button(ButtonType.mainCruise, "Steering_Data_FD1", "CcButtnOnOffPress", [1]),
 ]
+
+
+class FordSafetyFlagsSP:
+  """Sunnypilot-level safety flags for Ford.
+
+  Carried in CP_SP.safetyParam and delivered to the safety firmware as
+  current_safety_param_sp (the separate SP uint16, USB control 0xdf) -- NOT the main
+  safetyConfigs[].safetyParam. ford_init reads it with GET_FLAG(current_safety_param_sp,
+  ...), same pattern as Subaru STOP_AND_GO (subaru_common.h). Plain int constants, not
+  IntFlag: CP_SP.safetyParam must stay a plain int through capnp serialization in card.
+  """
+  STEER_ANGLE_CURVATURE = 1
+
+
+# Geometry-table index for the steering-angle curvature measurement, packed into
+# CP_SP.safetyParam bits 1-4 when STEER_ANGLE_CURVATURE is set. Must match the
+# ford_pinion_geometry table in safety/modes/ford.h row for row (enforced by
+# test_ford.py's geometry-consistency test against CarSpecs + calc_slip_factor).
+# Index 0 is reserved as invalid: the firmware treats flag-set-but-no-index as feature
+# off, so a half-configured param can never select the wrong geometry silently.
+# FORD_EDGE_MK2 is deliberately absent: ALT_STEER_ANGLE platforms read a RELATIVE pinion
+# angle (SteeringPinion_Data_Alt + learned offset) and lack the absolute measurement
+# this feature needs -- the toggle no-ops there and yaw behavior is kept.
+FORD_PINION_GEOMETRY_SHIFT = 1
+FORD_PINION_GEOMETRY_INDEX = {
+  CAR.FORD_BRONCO_SPORT_MK1: 1,
+  CAR.FORD_ESCAPE_MK4: 2,
+  CAR.FORD_ESCAPE_MK4_5: 3,
+  CAR.FORD_EXPEDITION_MK4: 4,
+  CAR.FORD_EXPLORER_MK6: 5,
+  CAR.FORD_FOCUS_MK4: 6,
+  CAR.FORD_F_150_LIGHTNING_MK1: 7,
+  CAR.FORD_F_150_MK14: 8,
+  CAR.FORD_MAVERICK_MK1: 9,
+  CAR.FORD_MONDEO_MK5: 10,
+  CAR.FORD_MUSTANG_MACH_E_MK1: 11,
+  CAR.FORD_RANGER_MK2: 12,
+}
 
 
 # BluePilot: Max curvature for steering command (m^-1), from DBC file limits

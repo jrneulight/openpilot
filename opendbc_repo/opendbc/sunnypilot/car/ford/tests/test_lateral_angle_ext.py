@@ -95,10 +95,10 @@ class _Actuators:
 class _Harness(LateralCurvExt, LateralAngleExt):
   """Mirrors CarController's mixin composition (see carcontroller.py)."""
 
-  def __init__(self, CP):
+  def __init__(self, CP, CP_SP=None):
     with mock.patch.object(lateral_curv_ext.messaging, 'SubMaster', _FakeSubMaster):
-      LateralCurvExt.__init__(self, CP, None)
-    LateralAngleExt.__init__(self, CP, None)
+      LateralCurvExt.__init__(self, CP, CP_SP)
+    LateralAngleExt.__init__(self, CP, CP_SP)
 
 
 class TestShadowCurvaturePublishing(unittest.TestCase):
@@ -149,6 +149,39 @@ class TestShadowCurvaturePublishing(unittest.TestCase):
     self.assertAlmostEqual(self.ext.bp_kappa_cmd, expected)
     self.assertNotAlmostEqual(self.ext.bp_kappa_cmd, self.measured)
     self.assertTrue(self.ext.bp_curvature_deviation_limited)
+
+
+class TestMeasurementSelection(unittest.TestCase):
+  """get_current_curvature must select by the CP_SP STEER_ANGLE_CURVATURE flag: yaw rate
+  by default (stock ford.h angle_meas family), pinion angle via the vehicle model when
+  the steering-angle curvature measurement is enabled (pinion ford.h angle_meas family).
+  """
+
+  V_EGO = 15.0
+
+  def _harness(self, flag):
+    CP = _explorer_cp()
+    CP_SP = structs.CarParamsSP()
+    if flag:
+      from opendbc.sunnypilot.car.ford.values_ext import FordSafetyFlagsSP
+      CP_SP.safetyParam |= FordSafetyFlagsSP.STEER_ANGLE_CURVATURE
+    return _Harness(CP, CP_SP), CP
+
+  def test_default_is_yaw_rate(self):
+    ext, _ = self._harness(flag=False)
+    cs = _CS(vEgoRaw=self.V_EGO, yawRate=0.75, steeringAngleDeg=30.0)
+    self.assertFalse(ext.bp_pinion_curvature_enabled)
+    self.assertAlmostEqual(ext.get_current_curvature(cs), -0.75 / self.V_EGO)
+
+  def test_flag_selects_pinion_vehicle_model(self):
+    import math as _math
+    from opendbc.car.vehicle_model import VehicleModel
+    ext, CP = self._harness(flag=True)
+    cs = _CS(vEgoRaw=self.V_EGO, yawRate=0.75, steeringAngleDeg=30.0)
+    self.assertTrue(ext.bp_pinion_curvature_enabled)
+    expected = -VehicleModel(CP).calc_curvature(_math.radians(30.0), self.V_EGO, 0.0)
+    self.assertAlmostEqual(ext.get_current_curvature(cs), expected)
+    self.assertNotAlmostEqual(ext.get_current_curvature(cs), -0.75 / self.V_EGO)
 
 
 if __name__ == '__main__':
