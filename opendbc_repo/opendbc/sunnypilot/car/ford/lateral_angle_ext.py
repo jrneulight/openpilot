@@ -107,6 +107,37 @@ _DEVIATION_CLIP_GATE_MS = 9.0  # m/s; below this the deviation clip (and stall d
 # fact), so stall detection can extend to the path-offset check's low-speed floor (5 m/s,
 # ford.h FORD_PATH_OFFSET_LIMITS.angle_error_min_speed). On yaw the 9 m/s distrust stands.
 _STALL_GATE_PINION_MS = 5.0
+
+# BluePilot: measured-delivery compensation for the path_angle actuator, active only with
+# the pinion measurement (the configuration it was measured in). The PSCM's steady-state
+# response to its commanded curvature (measured / wire kappa_cmd, hands-off, no
+# blip/press/transient) is speed-dependent and STABLE across four independent drives:
+# ~0.34 at 5-9 m/s, ~0.73-0.76 at 9-13, ~0.88-0.95 at 13-16, ~0.99-1.07 at 16-20
+# (slight over-delivery), ~0.91-1.01 at 20-27. Verified against the wire (LKA shadow =
+# actual kappa_cmd), so this is the plant-response stage, not the blend/clip: kcmd/des
+# stays 0.93-1.00 everywhere. Compensate with the inverse curve, conservative at the low
+# end: the 5-9 m/s naive inverse is 2.9x, far too aggressive to apply blindly (the PSCM
+# may cap low-speed authority by design), so the plateau extends down modestly and
+# tapers to a no-op at crawl speeds where there is no data at all; iterate on-road.
+# Applies only to the path_angle signal: kappa_cmd, the shadow, the deviation clip, and
+# the stall detector are untouched, and the soft ROC + DBC limits still bound the result.
+# PER-PLATFORM: the response curve is a property of each platform's PSCM/EPAS tune, so
+# the table is keyed by carFingerprint and only holds platforms it was actually measured
+# on (procedure: steady-state wire-based meas/kcmd decomposition -- hands-off, no
+# blip/press/engage-ramp, command settled, clip-bound frames excluded). Unmeasured
+# platforms get no compensation. Long-term this wants online estimation; a static
+# per-platform prior is the safe first step.
+_DELIVERY_COMP = {
+  # Low end (below ~9 m/s) measured on-road from clean hands-off episodes: delivery
+  # decays monotonically with falling speed (0.42 at 6.1 m/s -> 0.16 at 3.8 -> ~0.0 at
+  # crawl) -- the kappa*v mapping starves the command as v drops AND the PSCM derates
+  # low-speed authority (nonzero commands at <3 m/s produced zero wheel motion, so a
+  # plant deadband likely exists; the 2.2 cap recovers what is recoverable and keeps
+  # worst-case path_angle well inside DBC/soft-ROC bounds). 9 m/s and up validated at
+  # ~1.0 delivered with these values -- do not disturb.
+  'FORD_EXPLORER_MK6': ([1.5, 3.0, 4.5, 6.0, 8.0, 9.0, 13.0, 14.5, 16.0, 20.0, 23.5],
+                        [1.0, 1.8, 2.2, 2.2, 1.7, 1.30, 1.30, 1.09, 0.98, 0.98, 1.0]),
+}
 _STALL_BLIP_FRAMES = 6       # mode-0 pulse length (6 frames @ 20 Hz = 300 ms; PSCM acked mode 0 in ~150 ms on-road)
 _STALL_COOLDOWN_S = 2.0      # re-arm delay after a pulse (release ramp + PSCM response time)
 _STALL_MAX_BLIPS = 3         # give up on a stuck episode; devLim telemetry keeps recording the stall
@@ -444,6 +475,16 @@ class LateralAngleExt:
     # than only clipping the value reported to panda (which would make the check a no-op).
     current_curvature = self.get_current_curvature(CS)
     self.bp_curvature_deviation_limited = False
+    # kappa_drive is what steers; kappa_cmd is what the panda's shadow check sees. They
+    # were one variable, which coupled two contradictory jobs: the shadow MUST follow
+    # measured within the safety band (so the clip may raise it), while the steering
+    # command must never exceed what control requested. With that coupling, whenever the
+    # car overshot the request the clip's lower bound (measured - err) dragged the
+    # command up with the overshoot and HELD it there, unwinding only at the clip decay
+    # rate -- observed on-road as sticky nose-in once the delivery compensation improved
+    # tracking (51% of low-speed steady-state frames had command > request). The drive
+    # takes the clipped value except it can never be AMPLIFIED beyond the request.
+    kappa_drive = kappa_cmd
     if v_ego > _DEVIATION_CLIP_GATE_MS:
       _kappa_cmd_pre_error_clip = kappa_cmd
       kappa_cmd = float(clip(kappa_cmd, current_curvature - CarControllerParams.CURVATURE_ERROR,
@@ -451,6 +492,9 @@ class LateralAngleExt:
       # BluePilot: did this clip actually constrain kappa_cmd this frame (deviation from measured,
       # not rate-of-change -- see carcontroller.py)?
       self.bp_curvature_deviation_limited = bool(abs(kappa_cmd - _kappa_cmd_pre_error_clip) > 1e-9)
+      kappa_drive = kappa_cmd
+      if abs(kappa_drive) > abs(_kappa_cmd_pre_error_clip) and kappa_drive * _kappa_cmd_pre_error_clip >= 0:
+        kappa_drive = _kappa_cmd_pre_error_clip  # clip may reduce the drive, never amplify it
 
     lateral_uncertainty = 0.0  # no curvature-limit ladder until angle-mode torque display is defined
 
@@ -461,9 +505,14 @@ class LateralAngleExt:
     self.high_gain_calc = interp(v_ego, [13.5, 26.82], [(1.30 * self.low_speed_curv_factor), (self.path_angle_gain_highC_highV * self.high_speed_curv_factor)])
 
     # As the curve gets bigger, we will need a little boost to the signal to to not understeer
-    self.curvature_factor = interp(abs(kappa_cmd), [0.0007, 0.001], [self.low_gain_calc, self.high_gain_calc])
+    self.curvature_factor = interp(abs(kappa_drive), [0.0007, 0.001], [self.low_gain_calc, self.high_gain_calc])
 
-    path_angle_calc = kappa_cmd * v_ego * self.curvature_factor
+    path_angle_calc = kappa_drive * v_ego * self.curvature_factor
+    # measured-delivery compensation (see _DELIVERY_COMP above); pinion-measured platforms
+    # with a calibrated curve only
+    _comp = _DELIVERY_COMP.get(CP.carFingerprint) if self.bp_pinion_curvature_enabled else None
+    if _comp is not None:
+      path_angle_calc *= float(interp(v_ego, _comp[0], _comp[1]))
     path_angle = path_angle_calc
 
 

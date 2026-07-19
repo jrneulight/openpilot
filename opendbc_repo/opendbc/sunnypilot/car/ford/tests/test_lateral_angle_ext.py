@@ -31,6 +31,7 @@ from opendbc.sunnypilot.car.ford.lateral_angle_ext import LateralAngleExt
 
 def _explorer_cp():
   CP = structs.CarParams()
+  CP.carFingerprint = 'FORD_EXPLORER_MK6'
   CP.mass = 2050.
   CP.wheelbase = 3.025
   CP.steerRatio = 16.8
@@ -231,6 +232,140 @@ class TestLowSpeedStallRescue(unittest.TestCase):
     self._drive_stalled(ext, CP, v_ego=6.0, frames=12)
     self.assertEqual(ext.stall_blip_count, 0)
     self.assertEqual(ext.stall_blip_hold_s, 0.0)
+
+
+class TestDeliveryCompensation(unittest.TestCase):
+  """The measured-delivery compensation must scale ONLY the path_angle actuator signal,
+  only when the pinion measurement is enabled, and stay inside every existing bound."""
+
+  def _one_frame(self, flag, v_ego, desired=0.01):
+    ext, CP = _pinion_harness(flag=flag)
+    cs = _CS(vEgoRaw=v_ego, vEgo=v_ego, yawRate=0.0, steeringAngleDeg=0.0)
+    result = ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=desired), CP)
+    return ext, result
+
+  def test_comp_applied_when_pinion_enabled(self):
+    # v=10: comp is 1.30; measured 0 so the deviation clip pins kappa_cmd to +0.002 in
+    # both cases -- the returned path_angle ratio is exactly the compensation factor
+    from opendbc.sunnypilot.car.ford.lateral_angle_ext import _DELIVERY_COMP
+    from numpy import interp
+    _, r_off = self._one_frame(flag=False, v_ego=10.0)
+    _, r_on = self._one_frame(flag=True, v_ego=10.0)
+    bp, vv = _DELIVERY_COMP['FORD_EXPLORER_MK6']
+    expected = float(interp(10.0, bp, vv))
+    self.assertGreater(expected, 1.2)  # the band this exists for
+    self.assertAlmostEqual(r_on.path_angle / r_off.path_angle, expected, places=5)
+
+  def test_comp_inert_without_pinion_flag(self):
+    # yaw-measured cars keep today's behavior bit-identically
+    ext, r = self._one_frame(flag=False, v_ego=10.0)
+    self.assertAlmostEqual(r.path_angle, 0.002 * 10.0 * ext.curvature_factor)
+
+  def test_comp_no_op_at_crawl_speed(self):
+    from opendbc.sunnypilot.car.ford.lateral_angle_ext import _DELIVERY_COMP
+    from numpy import interp
+    bp, vv = _DELIVERY_COMP['FORD_EXPLORER_MK6']
+    self.assertEqual(float(interp(1.0, bp, vv)), 1.0)
+
+  def test_comp_inert_on_unmeasured_platform(self):
+    # the curve is a per-platform PSCM calibration: platforms without a measured row must
+    # get NO compensation even with the pinion toggle on
+    ext, CP = _pinion_harness(flag=True)
+    CP.carFingerprint = 'FORD_MAVERICK_MK1'
+    cs = _CS(vEgoRaw=10.0, vEgo=10.0, yawRate=0.0, steeringAngleDeg=0.0)
+    r = ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=0.01), CP)
+    self.assertAlmostEqual(r.path_angle, 0.002 * 10.0 * ext.curvature_factor)
+
+  def test_clip_never_amplifies_the_drive(self):
+    # measured curvature overshooting the request must not drag the steering command up
+    # with it (the sticky-hold observed on-road): the shadow still follows measured for
+    # the panda check, but the drive is capped at what control requested
+    ext, CP = _pinion_harness(flag=True)
+    v = 15.0
+    cs = _CS(vEgoRaw=v, vEgo=v, yawRate=0.0, steeringAngleDeg=-32.75)  # measured ~ +0.01
+    r = ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=0.004), CP)
+    measured = ext.get_current_curvature(cs)
+    self.assertGreater(measured, 0.009)
+    # shadow: clipped toward measured (panda-honest, inside the band)
+    self.assertAlmostEqual(ext.bp_kappa_cmd, measured - CarControllerParams.CURVATURE_ERROR, places=5)
+    # drive: the blended request, NOT the clip-raised value
+    from opendbc.sunnypilot.car.ford.lateral_angle_ext import _DELIVERY_COMP
+    from numpy import interp
+    request = 0.004 * (1.0 - ext.path_angle_blend_ratio)
+    bp, vv = _DELIVERY_COMP['FORD_EXPLORER_MK6']
+    expected_pa = request * v * ext.curvature_factor * float(interp(v, bp, vv))
+    self.assertAlmostEqual(r.path_angle, expected_pa, places=5)
+    self.assertLess(abs(r.path_angle), abs(ext.bp_kappa_cmd) * v * ext.curvature_factor)
+
+  def test_comp_table_envelope(self):
+    # guard future refits: monotonic breakpoints, factors within a SPEED-DEPENDENT
+    # envelope -- the large low-speed boosts (PSCM derate territory, low lateral energy)
+    # must never leak into mid/high-speed rows
+    from opendbc.sunnypilot.car.ford.lateral_angle_ext import _DELIVERY_COMP
+    for platform, (bp, vv) in _DELIVERY_COMP.items():
+      self.assertEqual(bp, sorted(bp), platform)
+      self.assertEqual(len(bp), len(vv), platform)
+      for b, f in zip(bp, vv, strict=True):
+        self.assertGreaterEqual(f, 0.9, platform)
+        self.assertLessEqual(f, 2.25 if b < 9.0 else 1.5, f'{platform} @ {b} m/s')
+
+  def test_comp_low_speed_region_applied(self):
+    # the v6 low-speed extension must actually reach the actuator signal: at 4.5 m/s the
+    # comp is 2.2 and the STEADY-STATE on/off path_angle ratio equals it exactly (the
+    # clip is inert below the 9 m/s gate; the first frame from rest is soft-ROC-limited
+    # by design, so drive several frames to convergence before comparing)
+    from opendbc.sunnypilot.car.ford.lateral_angle_ext import _DELIVERY_COMP
+    from numpy import interp
+
+    def steady(flag):
+      ext, CP = _pinion_harness(flag=flag)
+      cs = _CS(vEgoRaw=4.5, vEgo=4.5, yawRate=0.0, steeringAngleDeg=0.0)
+      for _ in range(10):
+        r = ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=0.01), CP)
+      return r.path_angle
+
+    bp, vv = _DELIVERY_COMP['FORD_EXPLORER_MK6']
+    expected = float(interp(4.5, bp, vv))
+    self.assertGreaterEqual(expected, 2.0)
+    self.assertAlmostEqual(steady(True) / steady(False), expected, places=5)
+
+  def test_dbc_limit_holds_at_strongest_boost(self):
+    # max curvature demand at the STRONGEST comp band (4.5-6 m/s, 2.2x), driven to
+    # steady state: DBC value clip must still bound every frame
+    from opendbc.sunnypilot.car.ford.lateral_angle_ext import FORD_DBC_PATH_ANGLE_MAX
+    ext, CP = _pinion_harness(flag=True)
+    cs = _CS(vEgoRaw=6.0, vEgo=6.0, yawRate=0.0, steeringAngleDeg=0.0)
+    for _ in range(60):
+      r = ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=0.02), CP)
+      self.assertLessEqual(abs(r.path_angle), FORD_DBC_PATH_ANGLE_MAX)
+
+  def test_comp_does_not_touch_shadow(self):
+    # the shadow (bp_kappa_cmd) is judged by ford.h against measured curvature -- the
+    # compensation must never inflate it
+    ext_on, _ = self._one_frame(flag=True, v_ego=10.0)
+    ext_off, _ = self._one_frame(flag=False, v_ego=10.0)
+    self.assertAlmostEqual(ext_on.bp_kappa_cmd, 0.002)   # clipped to measured(0) + CURVATURE_ERROR
+    self.assertAlmostEqual(ext_on.bp_kappa_cmd, ext_off.bp_kappa_cmd)
+
+  def test_dbc_limit_holds_at_worst_case(self):
+    # max curvature demand at the strongest comp band, driven to steady state: the DBC
+    # value clip must still bound the output every frame
+    from opendbc.sunnypilot.car.ford.lateral_angle_ext import FORD_DBC_PATH_ANGLE_MAX
+    ext, CP = _pinion_harness(flag=True)
+    cs = _CS(vEgoRaw=13.0, vEgo=13.0, yawRate=0.0, steeringAngleDeg=0.0)
+    for _ in range(60):
+      r = ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=0.02), CP)
+      self.assertLessEqual(abs(r.path_angle), FORD_DBC_PATH_ANGLE_MAX)
+
+  def test_soft_roc_still_limits_first_frame(self):
+    # the rate limit applies AFTER compensation: the first frame from rest can never step
+    # further than the soft ROC allows, no matter the boost
+    ext, CP = _pinion_harness(flag=True)
+    cs = _CS(vEgoRaw=13.0, vEgo=13.0, yawRate=0.0, steeringAngleDeg=0.0)
+    r = ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=0.02), CP)
+    from numpy import interp
+    soft_roc = float(interp(13.0, [9., 10., 15., 25.], [0.055, 0.055, 0.0425, 0.009]))
+    self.assertLessEqual(abs(r.path_angle), soft_roc + 1e-9)
 
 
 if __name__ == '__main__':
