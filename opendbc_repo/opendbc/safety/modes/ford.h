@@ -9,6 +9,7 @@
 #define FORD_BrakeSysFeatures      0x415U   // RX from ABS, for vehicle speed
 #define FORD_EngVehicleSpThrottle2 0x202U   // RX from PCM, for second vehicle speed
 #define FORD_Yaw_Data_FD1          0x91U    // RX from RCM, for yaw rate
+#define FORD_SteeringPinion_Data   0x7EU    // RX from PSCM, optional angle_meas source (STEER_ANGLE_CURVATURE)
 #define FORD_Steering_Data_FD1     0x083U   // TX by OP, various driver switches and LKAS/CC buttons
 #define FORD_ACCDATA               0x186U   // TX by OP, ACC controls
 #define FORD_ACCDATA_3             0x18AU   // TX by OP, ACC/TJA user interface
@@ -29,6 +30,9 @@ static uint8_t ford_get_counter(const CANPacket_t *msg) {
   } else if (msg->addr == FORD_Yaw_Data_FD1) {
     // Signal: VehRollYaw_No_Cnt
     cnt = msg->data[5];
+  } else if (msg->addr == FORD_SteeringPinion_Data) {
+    // Signal: StePinAn_No_Cnt (47|4@0+)
+    cnt = (msg->data[5] >> 4) & 0xFU;
   } else {
   }
   return cnt;
@@ -74,6 +78,8 @@ static bool ford_get_quality_flag_valid(const CANPacket_t *msg) {
     valid = ((msg->data[4] >> 5) & 0x3U) == 0x3U;  // VehVActlEng_D_Qf
   } else if (msg->addr == FORD_Yaw_Data_FD1) {
     valid = ((msg->data[6] >> 4) & 0x3U) == 0x3U;  // VehYawWActl_D_Qf
+  } else if (msg->addr == FORD_SteeringPinion_Data) {
+    valid = ((msg->data[5] >> 2) & 0x3U) == 0x3U;  // StePinCompAnEst_D_Qf (3=OK)
   } else {
   }
   return valid;
@@ -106,10 +112,14 @@ static bool ford_get_quality_flag_valid(const CANPacket_t *msg) {
 
 
 // Curvature rate limits
-#define FORD_LIMITS(limit_lateral_acceleration) {                                               \
+// max_angle_err: 100 (0.002) on the stock yaw-sourced angle_meas path; 150 (0.003) on the
+// BluePilot pinion-sourced path (STEER_ANGLE_CURVATURE), because the raw pinion angle has
+// no roll/alignment-offset compensation in firmware (the Python layer compensates via
+// liveParameters; firmware uses the raw pinion angle).
+#define FORD_LIMITS(limit_lateral_acceleration, max_angle_err) {                                \
   .max_angle = 1000,          /* 0.02 curvature */                                              \
   .angle_deg_to_can = 50000,  /* 1 / (2e-5) rad to can */                                       \
-  .max_angle_error = 100,     /* 0.002 * FORD_STEERING_LIMITS.angle_deg_to_can */               \
+  .max_angle_error = (max_angle_err),                                                           \
   /* Looser symmetric ROCs (former down table); Python control uses stricter up row in values_ext */ \
   .angle_rate_up_lookup = {                                                                     \
     {5., 16., 25.},                                                                             \
@@ -221,7 +231,39 @@ static const AngleSteeringLimits FORD_CURVATURE_RATE_LIMITS_CANFD = {
   .inactive_angle_is_zero = true,
 };
 
-static const AngleSteeringLimits FORD_STEERING_LIMITS = FORD_LIMITS(false);
+static const AngleSteeringLimits FORD_STEERING_LIMITS = FORD_LIMITS(false, 100);
+static const AngleSteeringLimits FORD_STEERING_LIMITS_PINION = FORD_LIMITS(false, 150);
+
+// BluePilot: per-platform geometry for pinion-angle -> curvature conversion (the optional
+// angle_meas source), selected by the 4-bit geometry index in current_safety_param_sp
+// bits 1-4. Row order and values must match FORD_PINION_GEOMETRY_INDEX in
+// opendbc/sunnypilot/car/ford/values_ext.py (enforced by test_ford.py's
+// geometry-consistency test against CarSpecs + calc_slip_factor(VehicleModel(CP))).
+// Index 0 is reserved as invalid; ford_init disables the feature outright on a zero or
+// out-of-range index so a half-configured param can never select the wrong geometry.
+// FORD_EDGE_MK2 (ALT_STEER_ANGLE: relative pinion angle + learned offset) is unsupported
+// and deliberately absent.
+#define FORD_PINION_GEOMETRY_COUNT 12U
+static const AngleSteeringParams ford_pinion_geometry[FORD_PINION_GEOMETRY_COUNT + 1U] = {
+  {.slip_factor = 0.0f, .steer_ratio = 1.0f, .wheelbase = 1.0f},                  // 0: invalid
+  {.slip_factor = -0.00062819555f, .steer_ratio = 17.7f, .wheelbase = 2.670f},    // 1: FORD_BRONCO_SPORT_MK1
+  {.slip_factor = -0.00061892325f, .steer_ratio = 16.7f, .wheelbase = 2.710f},    // 2: FORD_ESCAPE_MK4
+  {.slip_factor = -0.00061892325f, .steer_ratio = 16.7f, .wheelbase = 2.710f},    // 3: FORD_ESCAPE_MK4_5
+  {.slip_factor = -0.00045454798f, .steer_ratio = 17.0f, .wheelbase = 3.690f},    // 4: FORD_EXPEDITION_MK4
+  {.slip_factor = -0.00055447339f, .steer_ratio = 16.8f, .wheelbase = 3.025f},    // 5: FORD_EXPLORER_MK6
+  {.slip_factor = -0.00062121569f, .steer_ratio = 15.0f, .wheelbase = 2.700f},    // 6: FORD_FOCUS_MK4
+  {.slip_factor = -0.00045331952f, .steer_ratio = 16.9f, .wheelbase = 3.700f},    // 7: FORD_F_150_LIGHTNING_MK1
+  {.slip_factor = -0.00042037149f, .steer_ratio = 17.0f, .wheelbase = 3.990f},    // 8: FORD_F_150_MK14
+  {.slip_factor = -0.00054528036f, .steer_ratio = 17.0f, .wheelbase = 3.076f},    // 9: FORD_MAVERICK_MK1
+  {.slip_factor = -0.00058852001f, .steer_ratio = 14.8f, .wheelbase = 2.850f},    // 10: FORD_MONDEO_MK5
+  {.slip_factor = -0.00056209187f, .steer_ratio = 17.0f, .wheelbase = 2.984f},    // 11: FORD_MUSTANG_MACH_E_MK1
+  {.slip_factor = -0.00051293030f, .steer_ratio = 17.0f, .wheelbase = 3.270f},    // 12: FORD_RANGER_MK2
+};
+
+// BluePilot: steering-angle curvature measurement state (STEER_ANGLE_CURVATURE), set once
+// in ford_init from current_safety_param_sp. Default off = stock yaw-sourced angle_meas.
+static bool ford_bp_pinion_curvature = false;
+static const AngleSteeringParams *ford_bp_pinion_params = &ford_pinion_geometry[0];
 
 
 
@@ -396,12 +438,33 @@ static void ford_rx_hook(const CANPacket_t *msg) {
       speed_mismatch_check(filtered_pcm_speed);
     }
 
-    // Update vehicle yaw rate
-    if (msg->addr == FORD_Yaw_Data_FD1) {
+    // Update vehicle yaw rate (stock angle_meas source; skipped when the pinion source is enabled)
+    if ((msg->addr == FORD_Yaw_Data_FD1) && !ford_bp_pinion_curvature) {
       // Signal: VehYaw_W_Actl
       // TODO: we should use the speed which results in the closest angle measurement to the desired angle
       float ford_yaw_rate = (((msg->data[2] << 8U) | msg->data[3]) * 0.0002) - 6.5;
       float current_curvature = ford_yaw_rate / SAFETY_MAX(vehicle_speed.values[0] / VEHICLE_SPEED_FACTOR, 0.1);
+      // convert current curvature into units on CAN for comparison with desired curvature
+      update_sample(&angle_meas, ROUND(current_curvature * FORD_STEERING_LIMITS.angle_deg_to_can));
+    }
+
+    // BluePilot: optional angle_meas source -- measured curvature from the steering pinion
+    // angle (PSCM) via the vehicle model, for vehicles whose RCM broadcasts implausible yaw
+    // (sign-inverted vs IMU/steering geometry) while its quality flag still reads OK. The
+    // pinion angle was validated against the comma IMU (corr +0.99 on real routes); the
+    // Python control layer measures from the same source when this is enabled
+    // (lateral_curv_ext.get_current_curvature), so the layers always agree.
+    if ((msg->addr == FORD_SteeringPinion_Data) && ford_bp_pinion_curvature) {
+      // Signal: StePinComp_An_Est, 22|15@0+ (0.1,-1600) deg
+      int angle_raw = ((msg->data[2] & 0x7FU) << 8) | msg->data[3];
+      float pinion_angle_deg = ((float)angle_raw * 0.1f) - 1600.0f;
+      float pinion_angle_rad = pinion_angle_deg * 0.017453292519943295f;  // DEG_TO_RAD
+      // angle -> curvature via vehicle model (matches VehicleModel.curvature_factor);
+      // sign: firmware angle_meas is Ford wire convention (the yaw block uses +yaw/v), and
+      // pinion angle correlates +0.97 with wire desired curvature on real frames -> positive.
+      float speed = SAFETY_MAX(vehicle_speed.values[0] / VEHICLE_SPEED_FACTOR, 0.1);
+      float curvature_factor = get_curvature_factor(speed, *ford_bp_pinion_params);
+      float current_curvature = pinion_angle_rad * curvature_factor / ford_bp_pinion_params->steer_ratio;
       // convert current curvature into units on CAN for comparison with desired curvature
       update_sample(&angle_meas, ROUND(current_curvature * FORD_STEERING_LIMITS.angle_deg_to_can));
     }
@@ -590,7 +653,10 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // keeps its own checks regardless. But steer_angle_cmd_checks also carries the
     // controls_allowed gate bp-6.0 relied on for every frame; restore that piece explicitly so a
     // steer_control_enabled frame at curvature == 0 can't bypass it (see LMC2 block below).
-    bool curvature_violation = steer_angle_cmd_checks(desired_curvature, steer_control_enabled, FORD_STEERING_LIMITS);
+    // BluePilot: the pinion-sourced angle_meas variant carries a wider error band (150 vs 100) --
+    // see the FORD_LIMITS macro comment. Everything else in the two limit sets is identical.
+    const AngleSteeringLimits *ford_lmc_limits = ford_bp_pinion_curvature ? &FORD_STEERING_LIMITS_PINION : &FORD_STEERING_LIMITS;
+    bool curvature_violation = steer_angle_cmd_checks(desired_curvature, steer_control_enabled, *ford_lmc_limits);
     if (desired_curvature != 0) {
       violation |= curvature_violation;
     } else {
@@ -609,7 +675,7 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // it's still bounded by the tight path_angle range above and steer_control_enabled's own checks.
     if ((desired_curvature == 0) && ford_bp_angle_mode_engaged) {
       int shadow_curvature_can = FORD_BP_SHADOW_CURVATURE_TO_CAN(ford_bp_shadow_curvature_raw);
-      violation |= ford_shadow_curvature_error_check(shadow_curvature_can, steer_control_enabled, FORD_STEERING_LIMITS);
+      violation |= ford_shadow_curvature_error_check(shadow_curvature_can, steer_control_enabled, *ford_lmc_limits);
     }
 
     // Check path angle rate of change limits
@@ -649,7 +715,10 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
 
   // Safety check for LateralMotionControl2 action
   if (msg->addr == FORD_LateralMotionControl2) {
-    static const AngleSteeringLimits FORD_CANFD_STEERING_LIMITS = FORD_LIMITS(true);
+    static const AngleSteeringLimits FORD_CANFD_STEERING_LIMITS = FORD_LIMITS(true, 100);
+    static const AngleSteeringLimits FORD_CANFD_STEERING_LIMITS_PINION = FORD_LIMITS(true, 150);
+    // BluePilot: see the CAN handler's ford_lmc_limits comment.
+    const AngleSteeringLimits *ford_lmc2_limits = ford_bp_pinion_curvature ? &FORD_CANFD_STEERING_LIMITS_PINION : &FORD_CANFD_STEERING_LIMITS;
 
     // Signal: LatCtl_D2_Rq
     bool steer_control_enabled = ((msg->data[0] >> 4) & 0x7U) != 0U;
@@ -727,7 +796,7 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // keeps its own checks regardless. But steer_angle_cmd_checks also carries the
     // controls_allowed gate bp-6.0 relied on for every frame; restore that piece explicitly so a
     // steer_control_enabled frame at curvature == 0 can't bypass it.
-    bool curvature_violation = steer_angle_cmd_checks(desired_curvature, steer_control_enabled, FORD_CANFD_STEERING_LIMITS);
+    bool curvature_violation = steer_angle_cmd_checks(desired_curvature, steer_control_enabled, *ford_lmc2_limits);
     if (desired_curvature != 0) {
       violation |= curvature_violation;
     } else {
@@ -746,7 +815,7 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
     // it's still bounded by the tight path_angle range above and steer_control_enabled's own checks.
     if ((desired_curvature == 0) && ford_bp_angle_mode_engaged) {
       int shadow_curvature_can = FORD_BP_SHADOW_CURVATURE_TO_CAN(ford_bp_shadow_curvature_raw);
-      violation |= ford_shadow_curvature_error_check(shadow_curvature_can, steer_control_enabled, FORD_CANFD_STEERING_LIMITS);
+      violation |= ford_shadow_curvature_error_check(shadow_curvature_can, steer_control_enabled, *ford_lmc2_limits);
     }
 
     // Check path angle rate of change limits
@@ -793,18 +862,32 @@ static bool ford_tx_hook(const CANPacket_t *msg) {
 static safety_config ford_init(uint16_t param) {
   // warning: quality flags are not yet checked in openpilot's CAN parser,
   // this may be the cause of blocked messages
+  #define FORD_COMMON_RX_CHECKS \
+    {.msg = {{FORD_BrakeSysFeatures, 0, 8, 50U, .max_counter = 15U}, { 0 }, { 0 }}}, \
+    /* FORD_EngVehicleSpThrottle2 has a counter that either randomly skips or by 2, likely ECU bug */ \
+    /* Some hybrid models also experience a bug where this checksum mismatches for one or two frames under heavy acceleration with ACC */ \
+    /* It has been confirmed that the Bronco Sport's camera only disallows ACC for bad quality flags, not counters or checksums, so we match that */ \
+    {.msg = {{FORD_EngVehicleSpThrottle2, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}}, \
+    {.msg = {{FORD_Yaw_Data_FD1, 0, 8, 100U, .max_counter = 255U}, { 0 }, { 0 }}}, \
+    /* These messages have no counter or checksum */ \
+    {.msg = {{FORD_EngBrakeData, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+    {.msg = {{FORD_EngVehicleSpThrottle, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+    {.msg = {{FORD_DesiredTorqBrk, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+    {.msg = {{FORD_Steering_Data_FD1, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+
   static RxCheck ford_rx_checks[] = {
-    {.msg = {{FORD_BrakeSysFeatures, 0, 8, 50U, .max_counter = 15U}, { 0 }, { 0 }}},
-    // FORD_EngVehicleSpThrottle2 has a counter that either randomly skips or by 2, likely ECU bug
-    // Some hybrid models also experience a bug where this checksum mismatches for one or two frames under heavy acceleration with ACC
-    // It has been confirmed that the Bronco Sport's camera only disallows ACC for bad quality flags, not counters or checksums, so we match that
-    {.msg = {{FORD_EngVehicleSpThrottle2, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},
-    {.msg = {{FORD_Yaw_Data_FD1, 0, 8, 100U, .max_counter = 255U}, { 0 }, { 0 }}},
-    // These messages have no counter or checksum
-    {.msg = {{FORD_EngBrakeData, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{FORD_EngVehicleSpThrottle, 0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{FORD_DesiredTorqBrk, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{FORD_Steering_Data_FD1, 0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    FORD_COMMON_RX_CHECKS
+  };
+
+  // BluePilot: only enforced when the pinion angle_meas source is enabled -- keeping this
+  // entry in the stock config would make a pinion hiccup disable controls for users who
+  // never consume the message.
+  static RxCheck ford_rx_checks_pinion[] = {
+    FORD_COMMON_RX_CHECKS
+    // Pinion angle (angle_meas source). Counter verified 0-15 on real frames.
+    // StePinAn_No_Cs checksum algorithm is unknown (Ford sum-invert patterns don't match
+    // real frames) -> ignore_checksum; integrity via counter + quality flag + 100Hz check.
+    {.msg = {{FORD_SteeringPinion_Data, 0, 8, 100U, .max_counter = 15U, .ignore_checksum = true}, { 0 }, { 0 }}},
   };
 
   // BluePilot: an earlier design tried a dedicated CAN message (0x5F0) for python->ford.h state,
@@ -858,6 +941,21 @@ static safety_config ford_init(uint16_t param) {
   // Longitudinal is the default for CAN, and optional for CAN FD w/ ALLOW_DEBUG
   // ford_longitudinal = !ford_canfd || ford_longitudinal;
 
+  // BluePilot: steering-angle curvature measurement (bad-yaw-sensor workaround), read from
+  // the sunnypilot SP safety param (current_safety_param_sp, delivered via USB 0xdf before
+  // the safety model is set -- a separate uint16 from this function's param; pattern:
+  // subaru_common.h). Bit 0 enables; bits 1-4 carry the platform geometry-table index.
+  // A zero or out-of-range index disables the feature outright, so a half-configured param
+  // can never select the wrong geometry: the stock yaw path is kept in that case.
+  const uint16_t FORD_PARAM_SP_STEER_ANGLE_CURVATURE = 1;
+  bool pinion_enabled = GET_FLAG(current_safety_param_sp, FORD_PARAM_SP_STEER_ANGLE_CURVATURE);
+  const uint16_t pinion_geometry_index = (current_safety_param_sp >> 1) & 0xFU;
+  if ((pinion_geometry_index == 0U) || (pinion_geometry_index > FORD_PINION_GEOMETRY_COUNT)) {
+    pinion_enabled = false;
+  }
+  ford_bp_pinion_curvature = pinion_enabled;
+  ford_bp_pinion_params = pinion_enabled ? &ford_pinion_geometry[pinion_geometry_index] : &ford_pinion_geometry[0];
+
   safety_config ret;
   if (ford_canfd) {
     ret = ford_longitudinal ? BUILD_SAFETY_CFG(ford_rx_checks, FORD_CANFD_LONG_TX_MSGS) : \
@@ -865,6 +963,10 @@ static safety_config ford_init(uint16_t param) {
   } else {
     ret = ford_longitudinal ? BUILD_SAFETY_CFG(ford_rx_checks, FORD_LONG_TX_MSGS) : \
                               BUILD_SAFETY_CFG(ford_rx_checks, FORD_STOCK_TX_MSGS);
+  }
+  if (ford_bp_pinion_curvature) {
+    // Enforce 100Hz/counter/QF on the pinion message only when it is actually consumed.
+    SET_RX_CHECKS(ford_rx_checks_pinion, ret);
   }
   return ret;
 }

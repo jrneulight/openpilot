@@ -5,7 +5,10 @@ import unittest
 
 import opendbc.safety.tests.common as common
 from opendbc.car.ford.carcontroller import MAX_LATERAL_ACCEL
-from opendbc.car.ford.values import FordSafetyFlags
+from opendbc.car.ford.values import CAR, FordFlags, FordSafetyFlags
+from opendbc.car.interfaces import scale_tire_stiffness
+from opendbc.car.vehicle_model import VehicleModel, calc_slip_factor
+from opendbc.sunnypilot.car.ford.values_ext import FORD_PINION_GEOMETRY_INDEX, FORD_PINION_GEOMETRY_SHIFT, FordSafetyFlagsSP
 from opendbc.car.structs import CarParams
 from opendbc.safety.tests.libsafety import libsafety_py
 from opendbc.safety.tests.common import CANPackerSafety
@@ -66,6 +69,11 @@ class Buttons:
 #  * CAN FD with openpilot longitudinal
 
 class TestFordSafetyBase(common.CarSafetyTest):
+  # BluePilot: sunnypilot SP safety param (current_safety_param_sp), set before
+  # set_safety_hooks in every concrete setUp -- ford_init reads it. 0 = stock behavior;
+  # the pinion-curvature classes below override it (Toyota SAFETY_PARAM_SP convention).
+  SAFETY_PARAM_SP: int = 0
+
   STANDSTILL_THRESHOLD = 1
   RELAY_MALFUNCTION_ADDRS = {0: (MSG_ACCDATA_3, MSG_Lane_Assist_Data1, MSG_LateralMotionControl,
                                  MSG_LateralMotionControl2, MSG_IPMA_Data)}
@@ -489,6 +497,7 @@ class TestFordCANFDStockSafety(TestFordSafetyBase):
   def setUp(self):
     self.packer = CANPackerSafety("ford_lincoln_base_pt")
     self.safety = libsafety_py.libsafety
+    self.safety.set_current_safety_param_sp(self.SAFETY_PARAM_SP)
     self.safety.set_safety_hooks(CarParams.SafetyModel.ford, FordSafetyFlags.CANFD)
     self.safety.init_tests()
 
@@ -560,6 +569,7 @@ class TestFordLongitudinalSafety(TestFordLongitudinalSafetyBase):
   def setUp(self):
     self.packer = CANPackerSafety("ford_lincoln_base_pt")
     self.safety = libsafety_py.libsafety
+    self.safety.set_current_safety_param_sp(self.SAFETY_PARAM_SP)
     # Make sure we enforce long safety even without long flag for CAN
     self.safety.set_safety_hooks(CarParams.SafetyModel.ford, 0)
     self.safety.init_tests()
@@ -585,8 +595,263 @@ class TestFordCANFDLongitudinalSafety(TestFordLongitudinalSafetyBase):
   def setUp(self):
     self.packer = CANPackerSafety("ford_lincoln_base_pt")
     self.safety = libsafety_py.libsafety
+    self.safety.set_current_safety_param_sp(self.SAFETY_PARAM_SP)
     self.safety.set_safety_hooks(CarParams.SafetyModel.ford, FordSafetyFlags.LONG_CONTROL | FordSafetyFlags.CANFD)
     self.safety.init_tests()
+
+
+# =============================================================================
+# BluePilot: steering-angle curvature measurement (FordSafetyFlagsSP.STEER_ANGLE_CURVATURE)
+#
+# Opt-in alternative angle_meas source for vehicles whose RCM broadcasts implausible yaw
+# while its quality flag reads OK. The classes below run the ENTIRE stock test matrix with
+# angle_meas sourced from SteeringPinion_Data and the widened 0.003 error band, plus
+# pinion-specific tests. The stock (flag-off) classes above never set SAFETY_PARAM_SP, so
+# their outcomes (including any pre-existing failures) must stay bit-identical to the base
+# branch -- that comparison is the default-off zero-delta check.
+# =============================================================================
+
+class TestFordPinionCurvatureSafetyBase(TestFordSafetyBase):
+  MAX_CURVATURE_ERROR = 0.003  # widened: raw pinion angle has no roll/offset compensation in firmware
+
+  # Per-platform geometry (see the *PinionGeometry mixins). Values must match the
+  # ford_pinion_geometry row for GEOMETRY_INDEX -- the table itself is checked against
+  # CarSpecs + calc_slip_factor by TestFordPinionGeometryTable, so these literals only
+  # need to agree with that already-verified table.
+  GEOMETRY_INDEX = 0
+  PINION_SLIP_FACTOR = 0.0
+  PINION_STEER_RATIO = 1.0
+  PINION_WHEELBASE = 1.0
+
+  cnt_pinion = 0
+
+  def _curvature_to_pinion_angle_deg(self, curvature: float, speed: float) -> float:
+    # Inverse of the firmware conversion in ford_rx_hook (modes/ford.h):
+    # curvature = angle_rad * curvature_factor(speed) / steer_ratio
+    speed = max(speed, 0.1)
+    curvature_factor = 1. / (1. - (self.PINION_SLIP_FACTOR * (speed ** 2))) / self.PINION_WHEELBASE
+    angle_rad = curvature * self.PINION_STEER_RATIO / curvature_factor
+    return float(np.degrees(angle_rad))
+
+  def _pinion_quant_tol(self, speed: float) -> int:
+    # 0.1 deg DBC quantization -> curvature CAN units at this speed (+2 for float rounding)
+    speed = max(speed, 0.1)
+    curvature_factor = 1. / (1. - (self.PINION_SLIP_FACTOR * (speed ** 2))) / self.PINION_WHEELBASE
+    return int(np.radians(0.1) * curvature_factor / self.PINION_STEER_RATIO * self.DEG_TO_CAN) + 2
+
+  # Current curvature measurement (pinion-angle sourced, not yaw)
+  def _pinion_msg(self, curvature: float, speed: float, quality_flag=True):
+    values = {"StePinComp_An_Est": self._curvature_to_pinion_angle_deg(curvature, speed),
+              "StePinCompAnEst_D_Qf": 3 if quality_flag else 0,
+              "StePinAn_No_Cnt": self.cnt_pinion % 16}
+    self.__class__.cnt_pinion += 1
+    return self.packer.make_can_msg_safety("SteeringPinion_Data", 0, values)
+
+  def _reset_curvature_measurement(self, curvature, speed):
+    # 14 frames, not 6: frames after a counter discontinuity (e.g. rejected bad-QF frames
+    # advanced the python-side counter) are dropped by the rx counter check until it
+    # re-syncs, which would otherwise leave stale samples in the 6-deep angle_meas buffer
+    for _ in range(14):
+      self._rx(self._speed_msg(speed))
+      self._rx(self._pinion_msg(curvature, speed))
+
+  def _drain_reset_bypass_latch(self, curvature):
+    # ford.h arms a 60-frame bypass latch whenever a curvature==0 && path_angle==0 frame is
+    # sent (human-turn ramp-up support). Prior tests commonly end on zeroed commands, so the
+    # latch may be live. Drain it with >60 nonzero-curvature frames (each decrements it),
+    # keeping the command at the measured curvature so nothing else violates meanwhile.
+    self.safety.set_controls_allowed(True)
+    for _ in range(70):
+      self._set_prev_desired_angle(curvature)
+      self._tx(self._lat_ctl_msg(True, 0, 0, curvature, 0))
+      self.safety.set_controls_allowed(True)
+
+  def test_rx_hook(self):
+    # checksum, counter, and quality flag checks (stock matrix + the pinion message)
+    for quality_flag in [True, False]:
+      for msg_type in ["speed", "speed_2", "yaw", "pinion"]:
+        self.safety.set_controls_allowed(True)
+        # send multiple times to verify counter checks
+        for _ in range(10):
+          if msg_type == "speed":
+            msg = self._speed_msg(0, quality_flag=quality_flag)
+          elif msg_type == "speed_2":
+            msg = self._speed_msg_2(0, quality_flag=quality_flag)
+          elif msg_type == "yaw":
+            msg = self._yaw_rate_msg(0, 0, quality_flag=quality_flag)
+          elif msg_type == "pinion":
+            msg = self._pinion_msg(0, 0, quality_flag=quality_flag)
+
+          self.assertEqual(quality_flag, self._rx(msg))
+          self.assertEqual(quality_flag, self.safety.get_controls_allowed())
+
+        # Mess with checksum to make it fail; checksum is not checked for 2nd speed or pinion
+        # (pinion has an unknown OEM checksum algorithm; integrity is via counter + quality flag)
+        msg[0].data[3] = 0  # Speed checksum & half of yaw/pinion angle signal
+        should_rx = msg_type in ("speed_2", "pinion") and quality_flag
+        self.assertEqual(should_rx, self._rx(msg))
+        self.assertEqual(should_rx, self.safety.get_controls_allowed())
+
+  def test_angle_measurements(self):
+    """Tests rx hook correctly parses the curvature measurement from the steering pinion angle.
+
+    The DBC signal quantizes to 0.1 deg, so allow the quantization-equivalent CAN-unit
+    tolerance from the round trip through the packer.
+    """
+    for speed in np.arange(0.5, 40, 0.5):
+      for curvature in np.arange(0, self.MAX_CURVATURE * 2, 2e-3):
+        self._rx(self._speed_msg(speed))
+        for c in (curvature, -curvature, 0, 0, 0, 0):
+          self._rx(self._pinion_msg(c, speed))
+
+        quant_tol = self._pinion_quant_tol(speed)
+        self.assertAlmostEqual(self.safety.get_angle_meas_min(), round(-curvature * self.DEG_TO_CAN), delta=quant_tol)
+        self.assertAlmostEqual(self.safety.get_angle_meas_max(), round(curvature * self.DEG_TO_CAN), delta=quant_tol)
+
+        self._rx(self._pinion_msg(0, speed))
+        self.assertAlmostEqual(self.safety.get_angle_meas_min(), round(-curvature * self.DEG_TO_CAN), delta=quant_tol)
+        self.assertAlmostEqual(self.safety.get_angle_meas_max(), 0, delta=quant_tol)
+
+        self._rx(self._pinion_msg(0, speed))
+        self.assertAlmostEqual(self.safety.get_angle_meas_min(), 0, delta=quant_tol)
+        self.assertAlmostEqual(self.safety.get_angle_meas_max(), 0, delta=quant_tol)
+
+  def test_pinion_quality_flag_gates_measurement(self):
+    """A bad pinion quality flag must reject the message (measurement not updated)."""
+    speed = self.CURVATURE_ERROR_MIN_SPEED + 5
+    self._reset_curvature_measurement(0.005, speed)
+    meas_max_before = self.safety.get_angle_meas_max()
+    self.assertGreater(meas_max_before, 0)
+
+    # bad-QF frames must be rejected at rx and leave angle_meas untouched
+    for _ in range(6):
+      self.assertFalse(self._rx(self._pinion_msg(0, speed, quality_flag=False)))
+    self.assertEqual(self.safety.get_angle_meas_max(), meas_max_before)
+
+  def test_pinion_sign_convention(self):
+    """Command matching the measured curvature sign passes the error check; a sign-inverted
+    command (the broken-yaw failure mode) violates above the gate speed."""
+    speed = self.CURVATURE_ERROR_MIN_SPEED + 5
+    curvature = 0.005  # well above MAX_CURVATURE_ERROR so the inverted case must violate
+
+    for sign in (1, -1):
+      with self.subTest(sign=sign):
+        self._reset_curvature_measurement(sign * curvature, speed)
+        self._drain_reset_bypass_latch(sign * curvature)
+        self._set_prev_desired_angle(sign * curvature)
+        # matching-sign command: allowed
+        self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0, sign * curvature, 0)))
+        # inverted command (what a sign-flipped sensor would demand): blocked
+        self._set_prev_desired_angle(-sign * curvature)
+        self.assertFalse(self._tx(self._lat_ctl_msg(True, 0, 0, -sign * curvature, 0)))
+
+  def test_pinion_check_inert_below_gate_speed(self):
+    """Below CURVATURE_ERROR_MIN_SPEED the deviation check must not constrain commands."""
+    self.safety.set_controls_allowed(True)
+    speed = self.CURVATURE_ERROR_MIN_SPEED - 2
+    self._reset_curvature_measurement(0.005, speed)
+    # command far from measured, but below gate: allowed (rate limits still apply, so seed prev)
+    inverted = -0.005
+    self._set_prev_desired_angle(inverted)
+    self.assertTrue(self._tx(self._lat_ctl_msg(True, 0, 0, inverted, 0)))
+
+
+class FordExplorerPinionGeometry:
+  """FORD_EXPLORER_MK6 -- the on-road-validated primary platform."""
+  GEOMETRY_INDEX = 5
+  PINION_SLIP_FACTOR = -0.00055447339
+  PINION_STEER_RATIO = 16.8
+  PINION_WHEELBASE = 3.025
+  SAFETY_PARAM_SP = int(FordSafetyFlagsSP.STEER_ANGLE_CURVATURE) | (GEOMETRY_INDEX << FORD_PINION_GEOMETRY_SHIFT)
+
+
+class FordBroncoSportPinionGeometry:
+  """FORD_BRONCO_SPORT_MK1 -- smallest wheelbase in the table."""
+  GEOMETRY_INDEX = 1
+  PINION_SLIP_FACTOR = -0.00062819555
+  PINION_STEER_RATIO = 17.7
+  PINION_WHEELBASE = 2.670
+  SAFETY_PARAM_SP = int(FordSafetyFlagsSP.STEER_ANGLE_CURVATURE) | (GEOMETRY_INDEX << FORD_PINION_GEOMETRY_SHIFT)
+
+
+class FordF150PinionGeometry:
+  """FORD_F_150_MK14 -- largest wheelbase in the table."""
+  GEOMETRY_INDEX = 8
+  PINION_SLIP_FACTOR = -0.00042037149
+  PINION_STEER_RATIO = 17.0
+  PINION_WHEELBASE = 3.990
+  SAFETY_PARAM_SP = int(FordSafetyFlagsSP.STEER_ANGLE_CURVATURE) | (GEOMETRY_INDEX << FORD_PINION_GEOMETRY_SHIFT)
+
+
+class TestFordPinionLongitudinalSafety(FordExplorerPinionGeometry, TestFordPinionCurvatureSafetyBase, TestFordLongitudinalSafety):
+  pass
+
+
+class TestFordPinionCANFDStockSafety(FordExplorerPinionGeometry, TestFordPinionCurvatureSafetyBase, TestFordCANFDStockSafety):
+  pass
+
+
+class TestFordPinionCANFDLongitudinalSafety(FordExplorerPinionGeometry, TestFordPinionCurvatureSafetyBase, TestFordCANFDLongitudinalSafety):
+  pass
+
+
+class TestFordPinionBroncoSportSafety(FordBroncoSportPinionGeometry, TestFordPinionCurvatureSafetyBase, TestFordLongitudinalSafety):
+  pass
+
+
+class TestFordPinionF150Safety(FordF150PinionGeometry, TestFordPinionCurvatureSafetyBase, TestFordCANFDLongitudinalSafety):
+  pass
+
+
+class TestFordPinionGeometryTable(unittest.TestCase):
+  """The firmware geometry table must match CarSpecs + calc_slip_factor(VehicleModel(CP))
+  for every supported platform, so the table cannot rot as platforms change. Reads the
+  table through the ALLOW_DEBUG libsafety getters -- no header parsing."""
+
+  TX_MSGS: list = []  # not a CarSafetyTest; keeps common.py's cross-mode TX sweep happy
+
+  def test_geometry_matches_carspecs(self):
+    safety = libsafety_py.libsafety
+    count = safety.get_ford_pinion_geometry_count()
+    self.assertEqual(count, len(FORD_PINION_GEOMETRY_INDEX))
+    # the index rides bits 1-4 of current_safety_param_sp; growing past 15 would silently
+    # disable the firmware side while the control side still enables -- never allow it
+    self.assertLessEqual(count, 15)
+
+    seen = set()
+    for car in CAR:
+      if car.config.flags & FordFlags.ALT_STEER_ANGLE:
+        # relative pinion angle with a learned offset -- unsupported by design
+        self.assertNotIn(car, FORD_PINION_GEOMETRY_INDEX)
+        continue
+      self.assertIn(car, FORD_PINION_GEOMETRY_INDEX, f"{car} has no geometry-table row")
+      idx = FORD_PINION_GEOMETRY_INDEX[car]
+      self.assertTrue(1 <= idx <= count, f"{car}: index {idx} out of range")
+      self.assertNotIn(idx, seen, f"{car}: duplicate index {idx}")
+      seen.add(idx)
+
+      specs = car.config.specs
+      CP = CarParams()
+      CP.mass = specs.mass
+      CP.wheelbase = specs.wheelbase
+      CP.steerRatio = specs.steerRatio
+      CP.centerToFront = specs.wheelbase * specs.centerToFrontRatio
+      CP.tireStiffnessFactor = specs.tireStiffnessFactor
+      CP.tireStiffnessFront, CP.tireStiffnessRear = scale_tire_stiffness(
+        CP.mass, CP.wheelbase, CP.centerToFront, CP.tireStiffnessFactor)
+      slip_factor = calc_slip_factor(VehicleModel(CP))
+
+      self.assertAlmostEqual(safety.get_ford_pinion_geometry_steer_ratio(idx), specs.steerRatio, places=3, msg=str(car))
+      self.assertAlmostEqual(safety.get_ford_pinion_geometry_wheelbase(idx), specs.wheelbase, places=3, msg=str(car))
+      self.assertAlmostEqual(safety.get_ford_pinion_geometry_slip_factor(idx), slip_factor,
+                             delta=abs(slip_factor) * 1e-4, msg=str(car))
+
+  def test_invalid_index_row_is_inert(self):
+    # index 0 is the reserved invalid row: zero slip, unit ratios
+    safety = libsafety_py.libsafety
+    self.assertEqual(safety.get_ford_pinion_geometry_slip_factor(0), 0.0)
+    self.assertEqual(safety.get_ford_pinion_geometry_steer_ratio(0), 1.0)
+    self.assertEqual(safety.get_ford_pinion_geometry_wheelbase(0), 1.0)
 
 
 if __name__ == "__main__":
