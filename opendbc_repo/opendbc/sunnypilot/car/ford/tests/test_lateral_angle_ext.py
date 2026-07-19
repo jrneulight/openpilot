@@ -15,6 +15,7 @@ See the LICENSE.md file in the root directory for more details.
 # stays inside the check's band and re-engage frames never compare a stale zero against
 # real measured curvature.
 
+import math
 import unittest
 from dataclasses import dataclass
 from unittest import mock
@@ -23,6 +24,7 @@ from opendbc.car import structs
 from opendbc.car.ford.values import CarControllerParams
 from opendbc.car.interfaces import scale_tire_stiffness
 from opendbc.sunnypilot.car.ford import lateral_curv_ext
+from opendbc.sunnypilot.car.ford.values_ext import FordSafetyFlagsSP
 from opendbc.sunnypilot.car.ford.lateral_curv_ext import LateralCurvExt
 from opendbc.sunnypilot.car.ford.lateral_angle_ext import LateralAngleExt
 
@@ -101,6 +103,17 @@ class _Harness(LateralCurvExt, LateralAngleExt):
     LateralAngleExt.__init__(self, CP, CP_SP)
 
 
+def _pinion_harness(flag):
+  """Harness with the STEER_ANGLE_CURVATURE flag set (or not) on CP_SP, detector stubbed."""
+  CP = _explorer_cp()
+  CP_SP = structs.CarParamsSP()
+  if flag:
+    CP_SP.safetyParam |= FordSafetyFlagsSP.STEER_ANGLE_CURVATURE
+  ext = _Harness(CP, CP_SP)
+  ext.human_turn_detector = _ForcedDetector(False)
+  return ext, CP
+
+
 class TestShadowCurvaturePublishing(unittest.TestCase):
   V_EGO = 15.0
   YAW_RATE = 0.75  # rad/s -> measured curvature = -0.75 / 15 = -0.05 (OP convention)
@@ -159,29 +172,34 @@ class TestMeasurementSelection(unittest.TestCase):
 
   V_EGO = 15.0
 
-  def _harness(self, flag):
-    CP = _explorer_cp()
-    CP_SP = structs.CarParamsSP()
-    if flag:
-      from opendbc.sunnypilot.car.ford.values_ext import FordSafetyFlagsSP
-      CP_SP.safetyParam |= FordSafetyFlagsSP.STEER_ANGLE_CURVATURE
-    return _Harness(CP, CP_SP), CP
-
   def test_default_is_yaw_rate(self):
-    ext, _ = self._harness(flag=False)
+    ext, _ = _pinion_harness(flag=False)
     cs = _CS(vEgoRaw=self.V_EGO, yawRate=0.75, steeringAngleDeg=30.0)
     self.assertFalse(ext.bp_pinion_curvature_enabled)
     self.assertAlmostEqual(ext.get_current_curvature(cs), -0.75 / self.V_EGO)
 
   def test_flag_selects_pinion_vehicle_model(self):
-    import math as _math
     from opendbc.car.vehicle_model import VehicleModel
-    ext, CP = self._harness(flag=True)
+    ext, CP = _pinion_harness(flag=True)
     cs = _CS(vEgoRaw=self.V_EGO, yawRate=0.75, steeringAngleDeg=30.0)
     self.assertTrue(ext.bp_pinion_curvature_enabled)
-    expected = -VehicleModel(CP).calc_curvature(_math.radians(30.0), self.V_EGO, 0.0)
+    expected = -VehicleModel(CP).calc_curvature(math.radians(30.0), self.V_EGO, 0.0)
     self.assertAlmostEqual(ext.get_current_curvature(cs), expected)
     self.assertNotAlmostEqual(ext.get_current_curvature(cs), -0.75 / self.V_EGO)
+
+
+class TestInitializeFord(unittest.TestCase):
+  def test_safety_param_stays_a_plain_int(self):
+    """card serializes CP_SP to capnp, which rejects enum subclasses of int -- an
+    IntFlag-typed safetyParam crashed card on-device. Pin the exact type."""
+    from opendbc.sunnypilot.car.interfaces import _initialize_ford
+    CP = structs.CarParams()
+    CP.brand = 'ford'
+    CP.carFingerprint = 'FORD_EXPLORER_MK6'
+    CP_SP = structs.CarParamsSP()
+    _initialize_ford(CP, CP_SP, {"FordPrefSteerAngleCurvature": True})
+    self.assertEqual(CP_SP.safetyParam, 0xb)  # flag | (explorer index 5 << 1)
+    self.assertIs(type(CP_SP.safetyParam), int)
 
 
 if __name__ == '__main__':

@@ -68,6 +68,7 @@ class BluePilotLayout(Widget):
     # Toggle refresh list
     self._refresh_toggles = (
       ("send_hands_free_cluster_msg", self._show_hands_free_ui),
+      ("FordPrefSteerAngleCurvature", self._steer_angle_curvature),
       ("BPDisableLaneLineStatusColor", self._disable_lane_line_status_color),
       ("BPHideCameraView", self._hide_camera_view),
       ("BPRadRacerTheme", self._rad_racer_theme),
@@ -104,6 +105,17 @@ class BluePilotLayout(Widget):
       lambda: tr("Display BlueCruise UI on the cluster for supported vehicles."),
       initial_state=self._safe_get_bool(self._params, "send_hands_free_cluster_msg"),
       callback=lambda state: self._toggle_callback(state, "send_hands_free_cluster_msg"),
+      icon="monitoring.png"
+    )
+
+    # Ford steering-angle curvature measurement (bad-yaw-sensor workaround). Init-time:
+    # card reads it once at car init and mirrors it into the panda safety firmware, so a
+    # flip only takes effect after the next restart (safe to toggle any time).
+    self._steer_angle_curvature = toggle_item(
+      lambda: tr("Use Pinion Yaw Sensor"),
+      lambda: tr('Measures how the car is turning from the steering pinion angle sensor instead of a faulty RCM yaw sensor (symptoms: "Turn Exceeds Steering Limit" warnings, weak curve tracking, "Service AdvanceTrac"). Check with tools/ford_yaw_health_check.py. Applies the next time the car starts. Not available on the Edge.'),
+      initial_state=self._safe_get_bool(self._params, "FordPrefSteerAngleCurvature"),
+      callback=lambda state: self._toggle_callback(state, "FordPrefSteerAngleCurvature"),
       icon="monitoring.png"
     )
 
@@ -609,6 +621,7 @@ class BluePilotLayout(Widget):
       ]) +
       _section(tr("Vehicle"), [
         self._show_hands_free_ui,
+        self._steer_angle_curvature,
         self._vbatt_pause_charging,
       ]) +
       _section(tr("Visuals"), [
