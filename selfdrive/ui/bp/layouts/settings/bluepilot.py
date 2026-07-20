@@ -124,7 +124,7 @@ class BluePilotLayout(Widget):
 
     self._hide_steer_sat_alerts = toggle_item(
       lambda: tr("Hide Steering-Limit Alerts While Holding the Wheel"),
-      lambda: tr('Hides the "Turn Exceeds Steering Limit" warning only while the power steering itself reports your hands on the wheel. Light pressure against the turn usually triggers these warnings, and the steering rack detects that grip well below the pressure the driving software needs. If the rack reports hands-off, the warning always shows.'),
+      lambda: tr('Hides the "Turn Exceeds Steering Limit" warning while the power steering itself reports your hands on the wheel, and below ~25 mph while it reports lane centering unavailable (its built-in low-speed policy). Outside those two cases the warning always shows.'),
       initial_state=self._safe_get_bool(self._params, "FordPrefHideSteerSaturatedAlerts"),
       callback=lambda state: self._toggle_callback(state, "FordPrefHideSteerSaturatedAlerts"),
       icon="monitoring.png"

@@ -458,7 +458,12 @@ class SelfdriveD(CruiseHelper):
         suppress = False
         if self.hide_steer_sat_hands_on and 'carStateBP' in self.sm.data:
           pscm = self.sm['carStateBP'].pscmLatCtl
-          suppress = pscm.dataAvailable and not pscm.laHandsOff
+          hands_on = pscm.dataAvailable and not pscm.laHandsOff
+          # PSCM broadcasts centering policy-suppressed (LaActAvail bit1 clear; Q3: below
+          # ~40 km/h): the undershoot is the platform's own availability policy, and "Turn
+          # Exceeds Steering Limit" misdescribes it as a transient saturation. Same opt-in.
+          policy_suppressed = pscm.dataAvailable and pscm.laActAvail <= 1
+          suppress = hands_on or policy_suppressed
         if not suppress:
           self.events.add(EventName.steerSaturated)
 

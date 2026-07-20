@@ -63,8 +63,10 @@ sections:
     description: 'Hides the "Turn Exceeds Steering Limit" warning only while the power
       steering itself reports your hands on the wheel. Light pressure against the turn
       is what usually triggers these warnings, and the steering rack detects that grip
-      well below the pressure the driving software needs to notice it. If the steering
-      rack reports hands-off, the warning always shows.'
+      well below the pressure the driving software needs to notice it. Also hides the
+      warning below ~25 mph while the power steering reports lane centering unavailable
+      (its built-in low-speed policy; the warning misreads that as a steering limit).
+      Outside those two cases the warning always shows.'
   # --- Audio ---
   - key: BPUseCustomSounds
     widget: toggle
