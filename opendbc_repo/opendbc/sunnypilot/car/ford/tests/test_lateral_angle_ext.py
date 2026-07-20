@@ -234,6 +234,33 @@ class TestLowSpeedStallRescue(unittest.TestCase):
     self.assertEqual(ext.stall_blip_hold_s, 0.0)
 
 
+class TestStallFractionalGate(unittest.TestCase):
+  """The stall pulse must arm only on a fractional delivery failure (< 0.65x of the
+  demand), never on an honest deep-curve entry transient (0.7-0.85x of a large demand)
+  whose absolute gap clears _STALL_GAP_MIN on magnitude alone. On-road, such mid-curve
+  pulses each triggered a driver grab within 0.2 s."""
+
+  def _drive(self, desired, measured, frames=20, v_ego=10.0):
+    # yaw mode (flag off): measured curvature comes exactly from yawRate / v; at v > 9
+    # the deviation clip binds on the gap, so devLim provides the charging path.
+    ext, CP = _pinion_harness(flag=False)
+    cs = _CS(vEgoRaw=v_ego, vEgo=v_ego, yawRate=-measured * v_ego, steeringAngleDeg=0.0)
+    for _ in range(frames):
+      ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=desired), CP)
+    return ext
+
+  def test_entry_transient_never_fires(self):
+    # delivering 0.72x of a deep demand: gap 0.007 > _STALL_GAP_MIN, but not a stall
+    ext = self._drive(desired=0.025, measured=0.018)
+    self.assertEqual(ext.stall_blip_count, 0)
+    self.assertEqual(ext.stall_blip_hold_s, 0.0)
+
+  def test_true_stall_still_fires(self):
+    # delivering 0.2x of the same demand: fractional failure -> pulse
+    ext = self._drive(desired=0.025, measured=0.005)
+    self.assertEqual(ext.stall_blip_count, 1)
+
+
 class TestPressReleaseBlip(unittest.TestCase):
   # The hand-off blip must fire only on straight-ish roads (its design intent): a
   # mid-curve release must NOT trigger a 300 ms steering drop -- the press -> blip ->
