@@ -261,6 +261,42 @@ class TestStallFractionalGate(unittest.TestCase):
     self.assertEqual(ext.stall_blip_count, 1)
 
 
+class TestStallPinionFloor(unittest.TestCase):
+  """With the pinion measurement, the stall gap floor drops to 1.5x CURVATURE_ERROR:
+  the deviation clip caps the wire command at measured + CURVATURE_ERROR, so partial
+  attenuation pins the observable gap just under the 2.0x floor (on-road: p50 0.0032
+  vs 0.0040). Yaw mode keeps the 2.0x floor bit-identically."""
+
+  def _drive(self, flag, desired, measured, v_ego, frames=20):
+    ext, CP = _pinion_harness(flag=flag)
+    if flag:
+      # pinion measurement: set the steering angle via the vehicle model's own inverse
+      sa_deg = math.degrees(ext.VM.get_steer_from_curvature(-measured, v_ego, 0.0))
+      cs = _CS(vEgoRaw=v_ego, vEgo=v_ego, yawRate=0.0, steeringAngleDeg=sa_deg)
+    else:
+      cs = _CS(vEgoRaw=v_ego, vEgo=v_ego, yawRate=-measured * v_ego, steeringAngleDeg=0.0)
+    for _ in range(frames):
+      ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=desired), CP)
+    return ext
+
+  def test_pinion_fires_between_floors(self):
+    # gap 0.0038 (in (1.5x, 2.0x)), delivering 0.62x: the clip-hidden partial
+    # attenuation the 2.0x floor structurally cannot see (v=6: raw-gap charging)
+    ext = self._drive(flag=True, desired=0.010, measured=0.0062, v_ego=6.0)
+    self.assertEqual(ext.stall_blip_count, 1)
+
+  def test_yaw_floor_unchanged(self):
+    # same gap in yaw mode at v=10 (clip binding supplies charging): below 2.0x -> inert
+    ext = self._drive(flag=False, desired=0.010, measured=0.0062, v_ego=10.0)
+    self.assertEqual(ext.stall_blip_count, 0)
+    self.assertEqual(ext.stall_blip_hold_s, 0.0)
+
+  def test_pinion_inert_below_its_floor(self):
+    # gap 0.0029 < 1.5x with a real fractional deficit (0.64x): healthy-tracking margin
+    ext = self._drive(flag=True, desired=0.008, measured=0.0051, v_ego=6.0)
+    self.assertEqual(ext.stall_blip_count, 0)
+
+
 class TestPressReleaseBlip(unittest.TestCase):
   # The hand-off blip must fire only on straight-ish roads (its design intent): a
   # mid-curve release must NOT trigger a 300 ms steering drop -- the press -> blip ->

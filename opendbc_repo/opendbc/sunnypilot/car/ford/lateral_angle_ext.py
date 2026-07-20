@@ -108,6 +108,14 @@ _STALL_GAP_MIN = 2.0 * CarControllerParams.CURVATURE_ERROR  # desired must lead 
 # each followed by the driver grabbing the wheel within 0.2 s). True stalls measure
 # 0.28-0.59x delivered across every diagnosed route; entry transients 0.64x and above.
 _STALL_DELIVERY_FRACTION = 0.65
+# With the pinion measurement, partial attenuation hides below _STALL_GAP_MIN: the
+# deviation clip caps the wire command at measured + CURVATURE_ERROR, so the observable
+# gap of an attenuated-but-still-moving PSCM pins just UNDER 2x the tolerance
+# (engagement attenuation on-road: gap p50 0.0032, max 0.0047 -- the longest excursion
+# over 0.004 was 4 frames vs the 10 the hold needs). 1.5x sees through the clip's
+# ceiling while staying above healthy tracking error; yaw keeps 2.0x (noisier
+# measurement -- the very reason the pinion toggle exists).
+_STALL_GAP_MIN_PINION = 1.5 * CarControllerParams.CURVATURE_ERROR
 _STALL_HOLD_S = 0.5          # accumulated clip-binding time before a pulse fires
 _DEVIATION_CLIP_GATE_MS = 9.0  # m/s; below this the deviation clip (and stall detection on yaw) is inert
 # With the pinion measurement the geometric source is trustworthy at low speed (best there, in
@@ -612,9 +620,10 @@ class LateralAngleExt:
     # ~60 m-radius turn at 19 mph that the current gating could never rescue.
     self.stall_blip_cooldown_s = max(0.0, self.stall_blip_cooldown_s - _STEER_DT)
     _stall_gate_ms = _STALL_GATE_PINION_MS if self.bp_pinion_curvature_enabled else _DEVIATION_CLIP_GATE_MS
+    _stall_gap_min = _STALL_GAP_MIN_PINION if self.bp_pinion_curvature_enabled else _STALL_GAP_MIN
     _stall_gap = desired_curvature - current_curvature
     _stalled = (not CS.out.steeringPressed and not self.lane_change and v_ego > _stall_gate_ms
-                and abs(_stall_gap) > _STALL_GAP_MIN
+                and abs(_stall_gap) > _stall_gap_min
                 and abs(current_curvature) < _STALL_DELIVERY_FRACTION * abs(desired_curvature))
     if _stalled:
       _clip_can_bind = v_ego > _DEVIATION_CLIP_GATE_MS
@@ -627,7 +636,7 @@ class LateralAngleExt:
         self.stall_blip_count += 1
     else:
       self.stall_blip_hold_s = 0.0
-      if CS.out.steeringPressed or abs(_stall_gap) < 0.5 * _STALL_GAP_MIN:
+      if CS.out.steeringPressed or abs(_stall_gap) < 0.5 * _stall_gap_min:
         self.stall_blip_count = 0  # episode over: the car is tracking again or the driver took it
 
     ramp_type = 2
