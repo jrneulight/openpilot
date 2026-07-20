@@ -217,6 +217,14 @@ _PRESS_BLIP_MIN_S = 0.5      # press must last this long before its release earn
 # through a micro-release), and the straightness gate is evaluated at fire time, after
 # the window, so the road can't have curved underneath a stale decision.
 _PRESS_BLIP_DEBOUNCE_S = 0.4
+# Mid-curve releases skip the straightness gate ONLY when the PSCM is already attenuated
+# (measured under _PRESS_BLIP_ATTEN_FRAC of the demand at hand-off). Route 2e: curve
+# releases with healthy delivery picked up instantly and a pulse there is pure harm (the
+# original mid-curve cascade), but releases at 0.02x/-0.22x delivered waited 1.3-2.0 s
+# for the REACTIVE detector to charge and rescue -- a 300 ms pulse costs nothing when
+# the PSCM is delivering under half, and re-engages ~1.5 s sooner. 0.5 sits safely below
+# the 0.65 fractional stall boundary (honest entries never qualify).
+_PRESS_BLIP_ATTEN_FRAC = 0.5
 
 
 def pscm_d_ref_m(v_ego_ms: float) -> float:
@@ -440,9 +448,16 @@ class LateralAngleExt:
       # counts; a regrip inside the window resumes the same press without resetting its timer.
       self.press_release_s += _STEER_DT
       if self.press_release_s >= _PRESS_BLIP_DEBOUNCE_S:
+        _des_now = abs(float(actuators.curvature))
+        _straight = _des_now < _PRESS_BLIP_MAX_CURV
+        # attenuated mid-curve hand-off (see _PRESS_BLIP_ATTEN_FRAC): the pulse's 300 ms
+        # release costs nothing when the PSCM is barely delivering, and beats waiting for
+        # the reactive detector
+        _attenuated = (_des_now > 0.004
+                       and abs(self.get_current_curvature(CS)) < _PRESS_BLIP_ATTEN_FRAC * _des_now)
         if (self.press_timer_s >= _PRESS_BLIP_MIN_S and self.stall_blip_cooldown_s <= 0.0
             and self.stall_blip_frames_left <= 0
-            and abs(float(actuators.curvature)) < _PRESS_BLIP_MAX_CURV):
+            and (_straight or _attenuated)):
           self.stall_blip_frames_left = _STALL_BLIP_FRAMES
         self.press_timer_s = 0.0
         self.press_release_s = 0.0

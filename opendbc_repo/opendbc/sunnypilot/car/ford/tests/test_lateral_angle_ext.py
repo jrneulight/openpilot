@@ -506,10 +506,6 @@ class TestPressReleaseBlip(unittest.TestCase):
     self._drive(ext, CP, pressed=False, frames=release_frames, curvature=curvature)
     return ext
 
-  def test_no_blip_on_mid_curve_release(self):
-    ext = self._press_then_release(curvature=0.008)  # 125 m curve
-    self.assertEqual(ext.stall_blip_frames_left, 0)
-
   def test_blip_on_straight_release(self):
     ext = self._press_then_release(curvature=0.001)  # near-straight
     self.assertGreater(ext.stall_blip_frames_left, 0)
@@ -531,11 +527,36 @@ class TestPressReleaseBlip(unittest.TestCase):
     self.assertGreater(ext.stall_blip_frames_left, 0)
 
   def test_curvature_gate_evaluated_at_fire_time(self):
-    # straight at release, curved by the end of the debounce window -> no pulse
+    # straight at release, curved by the end of the debounce window, healthy plant -> no
+    # pulse (the car is mid-curve and delivering; a release would be the old cascade)
     ext, CP = _pinion_harness(flag=True)
     self._drive(ext, CP, pressed=True, frames=15, curvature=0.001)
     self._drive(ext, CP, pressed=False, frames=4, curvature=0.001)
-    self._drive(ext, CP, pressed=False, frames=5, curvature=0.008)  # curve arrives mid-window
+    sa = math.degrees(ext.VM.get_steer_from_curvature(-0.008, 8.0, 0.0))
+    cs = _CS(vEgoRaw=8.0, vEgo=8.0, yawRate=0.0, steeringAngleDeg=sa)  # delivering 1.0x
+    for _ in range(5):
+      ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=0.008), CP)
+    self.assertEqual(ext.stall_blip_frames_left, 0)
+
+  def test_attenuated_mid_curve_release_fires(self):
+    # deep demand, plant delivering ~0 at hand-off (post-press attenuation): the pulse
+    # fires despite the curve -- 300 ms of release costs nothing at 0x delivery, and it
+    # beats the reactive detector by ~1.5 s (route-2e hand-off audit)
+    ext, CP = _pinion_harness(flag=True)
+    self._drive(ext, CP, pressed=True, frames=15, curvature=0.008)
+    self._drive(ext, CP, pressed=False, frames=self.RELEASE_FRAMES, curvature=0.008)  # meas stays 0
+    self.assertGreater(ext.stall_blip_frames_left, 0)
+
+  def test_healthy_mid_curve_release_stays_quiet(self):
+    # same release with the plant tracking 0.9x: no pulse (attenuation gate not met)
+    ext, CP = _pinion_harness(flag=True)
+    sa = math.degrees(ext.VM.get_steer_from_curvature(-0.0072, 8.0, 0.0))
+    cs_p = _CS(vEgoRaw=8.0, vEgo=8.0, yawRate=0.0, steeringAngleDeg=sa, steeringPressed=True)
+    cs_f = _CS(vEgoRaw=8.0, vEgo=8.0, yawRate=0.0, steeringAngleDeg=sa)
+    for _ in range(15):
+      ext.update_angle_strategy(_CC(latActive=True), cs_p, _Actuators(curvature=0.008), CP)
+    for _ in range(self.RELEASE_FRAMES):
+      ext.update_angle_strategy(_CC(latActive=True), cs_f, _Actuators(curvature=0.008), CP)
     self.assertEqual(ext.stall_blip_frames_left, 0)
 
 
