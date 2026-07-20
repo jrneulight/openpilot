@@ -122,6 +122,27 @@ _DEVIATION_CLIP_GATE_MS = 9.0  # m/s; below this the deviation clip (and stall d
 # fact), so stall detection can extend to the path-offset check's low-speed floor (5 m/s,
 # ford.h FORD_PATH_OFFSET_LIMITS.angle_error_min_speed). On yaw the 9 m/s distrust stands.
 _STALL_GATE_PINION_MS = 5.0
+# Entry agility: predictive deviation-clip band center (pinion measurement only). On deep
+# curve entries the static clip caps the wire command at measured + CURVATURE_ERROR,
+# discarding commanded lead exactly when the learned-delay lookahead matters -- route-1e
+# saturation windows measured 0.0014 median discarded lead, 0.2-0.4 s entry lag, transient
+# delivery 0.78-0.90 with settled delivery at 1.00 (a pure phase problem). The band center
+# may lead the measurement toward the demand, but ONLY while the car is demonstrably moving
+# toward the demand (measured curvature rate agreeing in sign with the remaining command
+# gap); a frozen or runaway plant collapses the band to today's within two ticks. Bake-off
+# against a derivative predictor (measurement noise saturates any clamp on quiet frames)
+# and an ungated slew (recenters on the command even when the car is not following --
+# band-widening in disguise, and it starves the stall detector's charging on
+# attenuated-but-moving stalls): the gated slew cut clipped-off lead 33%/67% in the two
+# bake-off routes' saturation windows and fully freed 22-37% of entry episodes, with quiet-
+# frame band wander bounded by the actual tracking error rather than by the clamp. The
+# clamp keeps worst-case wire deviation at CURVATURE_ERROR + 0.0005 = 0.0025: the panda
+# pinion band is 0.003 and the layers disagree by up to ~0.0003 (python subtracts
+# liveParameters.angleOffsetDeg; the panda cannot), so the 0.001 first guess would have had
+# zero margin. Stall-detector charging stays keyed to the STATIC band
+# (bp_stall_charge_bound), making detector behavior bit-identical by construction.
+_BAND_LEAD_MAX = 0.0005   # 1/m; band-center lead clamp toward the demand
+_BAND_LEAD_SLEW = 0.005   # 1/m/s; full clamp reached after 0.1 s of confirmed turn-in
 # Press-release hand-off blip: only when the road is actually straight-ish. The blip's
 # design intent was always "at hand-off, while the car is straight and the command
 # small", but that was never enforced -- on-road, releases mid-curve fired a 300 ms
@@ -235,6 +256,9 @@ class LateralAngleExt:
     self.bp_angle_rate_limited = False      # path_angle soft-ROC clip actually bit this frame
     self.bp_curvature_rate_limited = False  # equivalent curvature would be rate-limited by curv-mode logic (sim)
     self.bp_curvature_deviation_limited = False  # current_curvature error-clip constrained kappa_cmd this frame
+    self.bp_stall_charge_bound = False  # static-band binding, feeds ONLY stall charging (entry agility keeps it un-led)
+    self.band_lead = 0.0                # predictive band-center offset toward the demand (entry agility)
+    self._meas_last_for_lead = 0.0      # previous-tick measured curvature for the follow-gate
     self.sim_curvature_last = 0.0           # shadow curvature-mode last for the curvatureRateLimited sim
     # Exit detection: track previous desired curvature to sense when planner is actively reducing
     self._desired_curvature_last = 0.0
@@ -332,6 +356,9 @@ class LateralAngleExt:
       # (ford.h skips the check while steer_control_enabled is 0, so the value is free to
       # follow the measurement during the inactive period itself.)
       self.bp_kappa_cmd = self.get_current_curvature(CS)
+      self.band_lead = 0.0
+      self.bp_stall_charge_bound = False
+      self._meas_last_for_lead = self.bp_kappa_cmd
       self.human_turn_detector.reset()
       self.angle_human_turn_active = False
       self.stall_blip_hold_s = 0.0
@@ -373,6 +400,9 @@ class LateralAngleExt:
       # there): the driver is steering, so the honest command is the car's actual curvature,
       # and the panda-latched shadow stays current for the re-engage frame.
       self.bp_kappa_cmd = self.get_current_curvature(CS)
+      self.band_lead = 0.0
+      self.bp_stall_charge_bound = False
+      self._meas_last_for_lead = self.bp_kappa_cmd
       # Keep exit detection current so resume doesn't compare against a stale pre-turn value.
       self._desired_curvature_last = float(actuators.curvature)
       # A human turn ends any stall episode -- its own mode 0 does the PSCM reset job. That also
@@ -432,6 +462,9 @@ class LateralAngleExt:
       self.sim_curvature_last = 0.0
       # Truthful shadow during the blip (see the inactive-path comment).
       self.bp_kappa_cmd = self.get_current_curvature(CS)
+      self.band_lead = 0.0
+      self.bp_stall_charge_bound = False
+      self._meas_last_for_lead = self.bp_kappa_cmd
       self._desired_curvature_last = float(actuators.curvature)
       self.precision_type = 1
       if self.stall_blip_frames_left <= 0:
@@ -553,16 +586,37 @@ class LateralAngleExt:
     # tracking (51% of low-speed steady-state frames had command > request). The drive
     # takes the clipped value except it can never be AMPLIFIED beyond the request.
     kappa_drive = kappa_cmd
+    self.bp_stall_charge_bound = False
     if v_ego > _DEVIATION_CLIP_GATE_MS:
       _kappa_cmd_pre_error_clip = kappa_cmd
-      kappa_cmd = float(clip(kappa_cmd, current_curvature - CarControllerParams.CURVATURE_ERROR,
-                            current_curvature + CarControllerParams.CURVATURE_ERROR))
+      # Entry agility (see _BAND_LEAD_MAX): the band center leads the measurement while the
+      # car is confirmed moving toward the demand; static otherwise, and always on yaw.
+      if self.bp_pinion_curvature_enabled:
+        _dmeas = current_curvature - self._meas_last_for_lead
+        _demand_gap = _kappa_cmd_pre_error_clip - current_curvature
+        _lead_target = float(clip(_demand_gap, -_BAND_LEAD_MAX, _BAND_LEAD_MAX)) if _dmeas * _demand_gap > 0.0 else 0.0
+        _step = _BAND_LEAD_SLEW * _STEER_DT
+        self.band_lead += float(clip(_lead_target - self.band_lead, -_step, _step))
+      else:
+        self.band_lead = 0.0
+      _band_center = current_curvature + self.band_lead
+      kappa_cmd = float(clip(kappa_cmd, _band_center - CarControllerParams.CURVATURE_ERROR,
+                            _band_center + CarControllerParams.CURVATURE_ERROR))
       # BluePilot: did this clip actually constrain kappa_cmd this frame (deviation from measured,
       # not rate-of-change -- see carcontroller.py)?
       self.bp_curvature_deviation_limited = bool(abs(kappa_cmd - _kappa_cmd_pre_error_clip) > 1e-9)
+      # Stall charging must not see the led band: an attenuated-but-still-moving stall keeps
+      # the follow-gate open and would starve the detector (bake-off: 30% -> 24% charging
+      # duty in the pre-rescue windows). Keyed to the static band, it is bit-identical.
+      _kappa_static = float(clip(_kappa_cmd_pre_error_clip, current_curvature - CarControllerParams.CURVATURE_ERROR,
+                                current_curvature + CarControllerParams.CURVATURE_ERROR))
+      self.bp_stall_charge_bound = bool(abs(_kappa_static - _kappa_cmd_pre_error_clip) > 1e-9)
       kappa_drive = kappa_cmd
       if abs(kappa_drive) > abs(_kappa_cmd_pre_error_clip) and kappa_drive * _kappa_cmd_pre_error_clip >= 0:
         kappa_drive = _kappa_cmd_pre_error_clip  # clip may reduce the drive, never amplify it
+    else:
+      self.band_lead = 0.0
+    self._meas_last_for_lead = current_curvature
 
     lateral_uncertainty = 0.0  # no curvature-limit ladder until angle-mode torque display is defined
 
@@ -677,7 +731,10 @@ class LateralAngleExt:
                 and abs(current_curvature) < _STALL_DELIVERY_FRACTION * abs(desired_curvature))
     if _stalled:
       _clip_can_bind = v_ego > _DEVIATION_CLIP_GATE_MS
-      _charging = self.bp_curvature_deviation_limited or (self.bp_pinion_curvature_enabled and not _clip_can_bind)
+      # Charging keys on the STATIC band (bp_stall_charge_bound), not the entry-agility led
+      # band -- see the clip block; a stall with a partially-following plant must charge
+      # exactly as it did before the predictive band center existed.
+      _charging = self.bp_stall_charge_bound or (self.bp_pinion_curvature_enabled and not _clip_can_bind)
       if _charging and self.stall_blip_cooldown_s <= 0.0:
         self.stall_blip_hold_s += _STEER_DT
       if self.stall_blip_hold_s >= _STALL_HOLD_S and self.stall_blip_count < _STALL_MAX_BLIPS:

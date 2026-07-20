@@ -356,6 +356,98 @@ class TestAvail0StallGate(unittest.TestCase):
     self.assertEqual(ext.stall_blip_count, 1)
 
 
+class TestEntryAgilityBandLead(unittest.TestCase):
+  """Predictive deviation-clip band center: leads only while the car is confirmed moving
+  toward the demand, keeps total wire deviation within CURVATURE_ERROR + _BAND_LEAD_MAX,
+  collapses to the static band on a frozen plant (and always on yaw), and never changes
+  what the stall detector's charging sees (static-band keyed). Profiles co-ramp the
+  demand with the measurement (planner demand tracks the car on real entries); a step
+  demand against a slow plant is the stall detector's territory, not this feature's."""
+
+  V = 12.0
+  ERR = CarControllerParams.CURVATURE_ERROR
+  LEAD = 0.0005
+  RAMP = [0.000625 * i for i in range(13)]  # briskly turning in, final 0.0075
+
+  @staticmethod
+  def _harness(flag):
+    # planner-only demand: the empty modelV2 in the fake SubMaster would otherwise halve
+    # the effective request through the predicted-curvature blend (b = 0.5)
+    ext, CP = _pinion_harness(flag=flag)
+    ext.path_angle_blend_ratio = 0.0
+    return ext, CP
+
+  def _cs_for_meas(self, ext, measured):
+    sa_deg = math.degrees(ext.VM.get_steer_from_curvature(-measured, self.V, 0.0))
+    return _CS(vEgoRaw=self.V, vEgo=self.V, steeringAngleDeg=sa_deg, yawRate=0.0)
+
+  def _co_ramp(self, ext, CP, gap, meas_seq=None):
+    # demand rides `gap` above a ramping measurement; gap in (ERR, stall floor) exercises
+    # the clip without ever arming the stall detector
+    for m in (meas_seq if meas_seq is not None else self.RAMP):
+      ext.update_angle_strategy(_CC(latActive=True), self._cs_for_meas(ext, m),
+                                _Actuators(curvature=m + gap), CP)
+
+  def test_frozen_plant_static_band(self):
+    ext, CP = self._harness(flag=True)
+    for _ in range(10):
+      ext.update_angle_strategy(_CC(latActive=True), self._cs_for_meas(ext, 0.004),
+                                _Actuators(curvature=0.02), CP)
+    self.assertEqual(ext.band_lead, 0.0)
+    self.assertAlmostEqual(ext.bp_kappa_cmd, 0.004 + self.ERR, places=6)
+
+  def test_following_plant_leads_and_clamps(self):
+    ext, CP = self._harness(flag=True)
+    self._co_ramp(ext, CP, gap=0.0025)
+    final_meas = self.RAMP[-1]
+    self.assertGreater(ext.bp_kappa_cmd, final_meas + self.ERR + 1e-9)     # led past static
+    self.assertLessEqual(ext.bp_kappa_cmd, final_meas + self.ERR + self.LEAD + 1e-9)
+
+  def test_sign_symmetry(self):
+    ext, CP = self._harness(flag=True)
+    self._co_ramp(ext, CP, gap=-0.0025, meas_seq=[-m for m in self.RAMP])
+    final_meas = -self.RAMP[-1]
+    self.assertLess(ext.bp_kappa_cmd, final_meas - self.ERR - 1e-9)
+    self.assertGreaterEqual(ext.bp_kappa_cmd, final_meas - self.ERR - self.LEAD - 1e-9)
+
+  def test_yaw_mode_never_leads(self):
+    ext, CP = self._harness(flag=False)
+    for m in self.RAMP:
+      cs = _CS(vEgoRaw=self.V, vEgo=self.V, yawRate=-m * self.V, steeringAngleDeg=0.0)
+      ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=m + 0.0025), CP)
+    self.assertEqual(ext.band_lead, 0.0)
+    self.assertAlmostEqual(ext.bp_kappa_cmd, self.RAMP[-1] + self.ERR, places=6)
+
+  def test_lead_decays_when_following_stops(self):
+    ext, CP = self._harness(flag=True)
+    self._co_ramp(ext, CP, gap=0.0015)  # inside the static band: gate open, no binding
+    self.assertGreater(ext.band_lead, 0.0)
+    final = self.RAMP[-1]
+    for _ in range(4):  # plant freezes; demand persists just outside the static band
+      ext.update_angle_strategy(_CC(latActive=True), self._cs_for_meas(ext, final),
+                                _Actuators(curvature=final + 0.0025), CP)
+    self.assertEqual(ext.band_lead, 0.0)
+    self.assertAlmostEqual(ext.bp_kappa_cmd, final + self.ERR, places=6)
+
+  def test_stall_charging_sees_static_band(self):
+    # demand just outside the static band but inside the led band: the actual clip is
+    # unbound (no devlim), yet stall charging must still see the static-band truth
+    ext, CP = self._harness(flag=True)
+    self._co_ramp(ext, CP, gap=0.0025)
+    m = self.RAMP[-1] + 0.000625  # ramp continues: follow-gate stays open
+    ext.update_angle_strategy(_CC(latActive=True), self._cs_for_meas(ext, m),
+                              _Actuators(curvature=m + self.ERR + 0.0003), CP)
+    self.assertFalse(ext.bp_curvature_deviation_limited)
+    self.assertTrue(ext.bp_stall_charge_bound)
+
+  def test_road_speed_pinion_stall_still_fires(self):
+    ext, CP = self._harness(flag=True)
+    for _ in range(14):  # frozen plant, deep step demand: the detector's territory
+      ext.update_angle_strategy(_CC(latActive=True), self._cs_for_meas(ext, 0.0),
+                                _Actuators(curvature=0.01), CP)
+    self.assertEqual(ext.stall_blip_count, 1)
+
+
 class TestPressReleaseBlip(unittest.TestCase):
   # The hand-off blip must fire only on straight-ish roads (its design intent): a
   # mid-curve release must NOT trigger a 300 ms steering drop -- the press -> blip ->
