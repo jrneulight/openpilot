@@ -554,6 +554,7 @@ struct CarStateBP @0xb057204d7deadf3f {
   hybridDrive @0 :HybridDrive;
   hybridBattery @1 :HybridBattery;
   brakeLightStatus @2 :BrakeLightStatus;
+  pscmLatCtl @3 :PscmLatCtl;
 
   struct HybridDrive {
     dataAvailable @0 :Bool;
@@ -579,6 +580,15 @@ struct CarStateBP @0xb057204d7deadf3f {
   struct BrakeLightStatus {
     dataAvailable @0 :Bool;
     brakeLightsOn @1 :Bool;
+  }
+
+  # Ford PSCM lateral-control status broadcast (Lane_Assist_Data3_FD1)
+  struct PscmLatCtl {
+    dataAvailable @0 :Bool;
+    laActAvail @1 :UInt8;  # LaActAvail_D_Actl: 2 = lateral control served, 0 = withdrawn by PSCM availability policy
+    laActDeny @2 :Bool;  # LaActDeny_B_Actl
+    laHandsOff @3 :Bool;  # LaHandsOff_B_Actl: PSCM hands-off estimate, more sensitive than steeringPressed
+    tjaHandsOnConfidence @4 :Bool;  # TjaHandsOnCnfdnc_B_Est
   }
 }
 
