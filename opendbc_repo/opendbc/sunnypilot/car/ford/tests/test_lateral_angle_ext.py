@@ -234,6 +234,29 @@ class TestLowSpeedStallRescue(unittest.TestCase):
     self.assertEqual(ext.stall_blip_hold_s, 0.0)
 
 
+class TestPressReleaseBlip(unittest.TestCase):
+  # The hand-off blip must fire only on straight-ish roads (its design intent): a
+  # mid-curve release must NOT trigger a 300 ms steering drop -- the press -> blip ->
+  # lane-sag -> press cascade observed on-road.
+
+  def _press_then_release(self, curvature):
+    ext, CP = _pinion_harness(flag=True)
+    cs_pressed = _CS(vEgoRaw=8.0, vEgo=8.0, yawRate=0.0, steeringAngleDeg=0.0, steeringPressed=True)
+    for _ in range(15):  # > _PRESS_BLIP_MIN_S of pressing
+      ext.update_angle_strategy(_CC(latActive=True), cs_pressed, _Actuators(curvature=curvature), CP)
+    cs_free = _CS(vEgoRaw=8.0, vEgo=8.0, yawRate=0.0, steeringAngleDeg=0.0)
+    ext.update_angle_strategy(_CC(latActive=True), cs_free, _Actuators(curvature=curvature), CP)
+    return ext
+
+  def test_no_blip_on_mid_curve_release(self):
+    ext = self._press_then_release(curvature=0.008)  # 125 m curve
+    self.assertEqual(ext.stall_blip_frames_left, 0)
+
+  def test_blip_on_straight_release(self):
+    ext = self._press_then_release(curvature=0.001)  # near-straight
+    self.assertGreater(ext.stall_blip_frames_left, 0)
+
+
 class TestDeliveryCompensation(unittest.TestCase):
   """The measured-delivery compensation must scale ONLY the path_angle actuator signal,
   only when the pinion measurement is enabled, and stay inside every existing bound."""
