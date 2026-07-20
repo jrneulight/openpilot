@@ -750,6 +750,29 @@ class TestCrawlLab(unittest.TestCase):
     self.assertFalse(ext.crawl_lab.active)
     self.assertLess(abs(pa[-1]), 0.001)
 
+  def test_full_cycle_all_signals_bounded(self):
+    # one full pattern cycle (~111 s): every lever reaches a meaningful amplitude and
+    # every signal respects its bound and slew; blip frames (mode 0) return zeros and
+    # stay continuous with the surrounding zero phases
+    ext, CP = _pinion_harness(flag=True)
+    ext.crawl_lab.enabled = True
+    cs = _CS(vEgoRaw=self.V, vEgo=self.V, yawRate=0.0, steeringAngleDeg=0.0)
+    pa, po, cv, blips = [], [], [], 0
+    for _ in range(2700):  # full 127 s cycle incl. the final blip_then_pa phase
+      r = ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=0.003), CP)
+      pa.append(r.path_angle); po.append(r.path_offset); cv.append(r.apply_curvature)
+      blips += int(ext.angle_stall_blip_active)
+    pa, po, cv = np.array(pa), np.array(po), np.array(cv)
+    self.assertGreater(np.abs(pa).max(), 0.15)                 # pa ladder reached
+    self.assertLessEqual(np.abs(pa).max(), 0.20 + 1e-6)
+    self.assertGreater(np.abs(po).max(), 0.3)                  # offset lever exercised
+    self.assertLessEqual(np.abs(po).max(), 0.5 + 1e-6)
+    self.assertGreater(np.abs(cv).max(), 0.008)                # curvature lever exercised
+    self.assertLessEqual(np.abs(cv).max(), 0.02 + 1e-6)
+    self.assertLessEqual(np.abs(np.diff(pa)).max(), 0.0075 + 1e-6)
+    self.assertLessEqual(np.abs(np.diff(cv)).max(), 0.001 + 1e-6)
+    self.assertGreaterEqual(blips, 4)                          # fresh-authority mode-0 pulse ran
+
 
 if __name__ == '__main__':
   unittest.main()

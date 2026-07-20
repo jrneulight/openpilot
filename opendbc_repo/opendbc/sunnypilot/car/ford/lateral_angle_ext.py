@@ -486,6 +486,7 @@ class LateralAngleExt:
       self.bp_stall_charge_bound = False
       self._meas_last_for_lead = self.bp_kappa_cmd
       self._desired_curvature_last = float(actuators.curvature)
+      self.crawl_lab.notify_mode0()
       self.precision_type = 1
       if self.stall_blip_frames_left <= 0:
         self.stall_blip_cooldown_s = _STALL_COOLDOWN_S
@@ -688,13 +689,21 @@ class LateralAngleExt:
     # crawl speeds, hands-off and engaged, override the wire stimulus with the probe
     # pattern (see crawl_lab.py). Placed before the soft ROC so the pattern inherits its
     # rate protection and path_angle_last stays continuous for a smooth hand-back.
+    lab_curvature = 0.0
     if self.crawl_lab.enabled or self.crawl_lab.active:
-      _lab_pa, _lab_po = self.crawl_lab.update(
+      _lab_pa, _lab_po, _lab_curv = self.crawl_lab.update(
         bool(CC.latActive) and self.bp_pinion_curvature_enabled,
         bool(CS.out.steeringPressed), v_ego, _STEER_DT)
       if self.crawl_lab.active:
         path_angle = float(min(FORD_DBC_PATH_ANGLE_MAX, max(FORD_DBC_PATH_ANGLE_MIN, _lab_pa)))
         path_offset = float(min(0.9, max(-0.9, _lab_po)))
+        lab_curvature = float(min(0.02, max(-0.02, _lab_curv)))
+        if self.crawl_lab.precision is not None:
+          self.precision_type = self.crawl_lab.precision
+        if self.crawl_lab.ramp_type is not None:
+          ramp_type = self.crawl_lab.ramp_type
+        if self.crawl_lab.request_blip and self.stall_blip_frames_left <= 0 and self.stall_blip_cooldown_s <= 0.0:
+          self.stall_blip_frames_left = _STALL_BLIP_FRAMES  # fresh-authority phase: mode-0 pulse first
 
     # Soft ROC limit — unconditional, slightly tighter than ford.h, applied before the
     # hardware bypass in ford.h is re-enabled.  Lets us observe whether the limit would
@@ -714,8 +723,10 @@ class LateralAngleExt:
     self.bp_angle_rate_limited = bool(abs(path_angle - _path_angle_pre_roc) > 1e-9)
 
 
-    # c0 always zero -- no centering trim in angle mode.
-    path_offset = 0.0
+    # c0 always zero -- no centering trim in angle mode (crawl-lab offset phases are the
+    # experiment-branch exception: the lab exists to test the levers angle mode never uses).
+    if not self.crawl_lab.active:
+      path_offset = 0.0
 
     # Telemetry / state
     self.bp_path_angle_gain_lowC_highV = self.path_angle_gain_lowC_highV
@@ -789,7 +800,7 @@ class LateralAngleExt:
 
 
     return LateralResult(
-      apply_curvature=0.0,
+      apply_curvature=lab_curvature,  # 0.0 except during crawl-lab curvature phases
       curvature_rate=curvature_rate,
       path_offset=path_offset,
       path_angle=path_angle,
