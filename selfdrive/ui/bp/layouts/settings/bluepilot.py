@@ -71,6 +71,7 @@ class BluePilotLayout(Widget):
       ("send_hands_free_cluster_msg", self._show_hands_free_ui),
       ("FordPrefSteerAngleCurvature", self._steer_angle_curvature),
       ("FordPrefHideSteerSaturatedAlerts", self._hide_steer_sat_alerts),
+      ("FordCrawlLabEnable", self._crawl_lab_enable),
       ("BPDisableLaneLineStatusColor", self._disable_lane_line_status_color),
       ("BPHideCameraView", self._hide_camera_view),
       ("BPRadRacerTheme", self._rad_racer_theme),
@@ -127,6 +128,14 @@ class BluePilotLayout(Widget):
       lambda: tr('Hides the "Turn Exceeds Steering Limit" warning while the power steering itself reports your hands on the wheel, and below ~25 mph while it reports lane centering unavailable (its built-in low-speed policy). Outside those two cases the warning always shows.'),
       initial_state=self._safe_get_bool(self._params, "FordPrefHideSteerSaturatedAlerts"),
       callback=lambda state: self._toggle_callback(state, "FordPrefHideSteerSaturatedAlerts"),
+      icon="monitoring.png"
+    )
+
+    self._crawl_lab_enable = toggle_item(
+      lambda: tr("Crawl Lab (EXPERIMENT)"),
+      lambda: tr("EXPERIMENT: in an EMPTY PARKING LOT only. While engaged, hands-off and below 10 mph, the wheel will move by itself through a repeating left/right test pattern to probe low-speed steering response. Touching the wheel stops it instantly. Do not use in traffic. Turn OFF after the test."),
+      initial_state=self._safe_get_bool(self._params, "FordCrawlLabEnable"),
+      callback=lambda state: self._toggle_callback(state, "FordCrawlLabEnable"),
       icon="monitoring.png"
     )
 
@@ -665,6 +674,7 @@ class BluePilotLayout(Widget):
         self._show_hands_free_ui,
         self._steer_angle_curvature,
         self._hide_steer_sat_alerts,
+        self._crawl_lab_enable,
         self._vbatt_pause_charging,
       ]) +
       _section(tr("Audio"), [

@@ -16,6 +16,7 @@ See the LICENSE.md file in the root directory for more details.
 # real measured curvature.
 
 import math
+import numpy as np
 import unittest
 from dataclasses import dataclass
 from unittest import mock
@@ -692,6 +693,62 @@ class TestDeliveryCompensation(unittest.TestCase):
     from numpy import interp
     soft_roc = float(interp(13.0, [9., 10., 15., 25.], [0.055, 0.055, 0.0425, 0.009]))
     self.assertLessEqual(abs(r.path_angle), soft_roc + 1e-9)
+
+
+class TestCrawlLab(unittest.TestCase):
+  """EXPERIMENT branch: the crawl-speed stimulus lab. Default OFF and inert; when
+  enabled it only acts engaged + hands-off + below the speed gate, every transition
+  slew-bounded; a press releases the override on the same tick."""
+
+  V = 2.0  # crawl
+
+  def _run(self, ext, CP, frames, v=None, pressed=False, des=0.003):
+    v = self.V if v is None else v
+    cs = _CS(vEgoRaw=v, vEgo=v, yawRate=0.0, steeringAngleDeg=0.0, steeringPressed=pressed)
+    out = []
+    for _ in range(frames):
+      r = ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=des), CP)
+      out.append(r.path_angle)
+    return np.array(out)
+
+  def test_default_off_inert(self):
+    ext, CP = _pinion_harness(flag=True)
+    pa = self._run(ext, CP, 120)
+    self.assertFalse(ext.crawl_lab.active)
+    self.assertLess(np.abs(pa).max(), 0.02)  # normal small-command territory only
+
+  def test_enabled_runs_pattern_bounded_and_slewed(self):
+    ext, CP = _pinion_harness(flag=True)
+    ext.crawl_lab.enabled = True
+    pa = self._run(ext, CP, 140)  # past the 3 s baseline into the +-0.05 phases
+    self.assertTrue(ext.crawl_lab.active)
+    self.assertGreater(np.abs(pa).max(), 0.02)          # the pattern actually stimulates
+    self.assertLessEqual(np.abs(pa).max(), 0.05 + 1e-6)  # first-phase amplitude bound
+    self.assertLessEqual(np.abs(np.diff(pa)).max(), 0.0075 + 1e-6)  # slew bound
+
+  def test_press_releases_immediately(self):
+    ext, CP = _pinion_harness(flag=True)
+    ext.crawl_lab.enabled = True
+    self._run(ext, CP, 140)
+    self._run(ext, CP, 1, pressed=True)
+    self.assertFalse(ext.crawl_lab.active)
+
+  def test_speed_gate(self):
+    ext, CP = _pinion_harness(flag=True)
+    ext.crawl_lab.enabled = True
+    self._run(ext, CP, 140, v=6.0)  # above _LAB_MAX_V_MS
+    self.assertFalse(ext.crawl_lab.active)
+
+  def test_speed_exceed_ramps_out_smoothly(self):
+    # zero demand on hand-back: the series then isolates the lab's own ramp-out (once
+    # inert, normal control ramps in through the soft ROC at its own faster rate)
+    ext, CP = _pinion_harness(flag=True)
+    ext.crawl_lab.enabled = True
+    self._run(ext, CP, 140)                            # pattern active
+    pa = self._run(ext, CP, 40, v=6.0, des=0.0)        # gate lost: ramp to zero, then inert
+    self.assertLessEqual(np.abs(np.diff(pa)).max(), 0.0075 + 1e-6)
+    self.assertFalse(ext.crawl_lab.active)
+    self.assertLess(abs(pa[-1]), 0.001)
 
 
 if __name__ == '__main__':

@@ -29,6 +29,7 @@ from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.ford.values import CAR, CarControllerParams
 from opendbc.sunnypilot.car.ford.lateral_curv_ext import LateralResult
 from opendbc.sunnypilot.car.ford.human_turn import HumanTurnDetector
+from opendbc.sunnypilot.car.ford.crawl_lab import CrawlLab
 from opendbc.sunnypilot.car.ford.values_ext import BP_ANGLE_LIMITS
 from selfdrive.modeld.constants import ModelConstants
 
@@ -287,6 +288,7 @@ class LateralAngleExt:
     self.stall_blip_count = 0         # pulses fired this stall episode
     self.angle_stall_blip_active = False
     self.press_timer_s = 0.0          # continuous steeringPressed time, for the hand-off blip
+    self.crawl_lab = CrawlLab()       # EXPERIMENT branch: crawl-speed stimulus lab
     self.press_release_s = 0.0        # time since release while a press is pending (debounce)
     self.attn_trigger_age_s = 3600.0  # time since press/human-turn/engage (avail=0 stall gate)
     self._lat_active_prev = False
@@ -294,6 +296,7 @@ class LateralAngleExt:
   def update_angle_params(self, params):
     """Sets per-platform gain defaults and reads user feel-factor params."""
     self._ensure_lateral_curv_initialized(self.CP)
+    self.crawl_lab.enabled = params.get_bool("FordCrawlLabEnable")
     fp = getattr(self.CP, 'carFingerprint', '')
     if fp in _CANFD_BOF_CARS:
       low, high = _GAIN_CANFD_BOF
@@ -680,6 +683,18 @@ class LateralAngleExt:
       path_angle = float(clip(path_angle, -abs(self.path_angle_last), abs(self.path_angle_last)))
 
     path_angle = min(FORD_DBC_PATH_ANGLE_MAX, max(FORD_DBC_PATH_ANGLE_MIN, path_angle))
+
+    # BluePilot crawl lab (EXPERIMENT BRANCH ONLY, FordCrawlLabEnable, default OFF): at
+    # crawl speeds, hands-off and engaged, override the wire stimulus with the probe
+    # pattern (see crawl_lab.py). Placed before the soft ROC so the pattern inherits its
+    # rate protection and path_angle_last stays continuous for a smooth hand-back.
+    if self.crawl_lab.enabled or self.crawl_lab.active:
+      _lab_pa, _lab_po = self.crawl_lab.update(
+        bool(CC.latActive) and self.bp_pinion_curvature_enabled,
+        bool(CS.out.steeringPressed), v_ego, _STEER_DT)
+      if self.crawl_lab.active:
+        path_angle = float(min(FORD_DBC_PATH_ANGLE_MAX, max(FORD_DBC_PATH_ANGLE_MIN, _lab_pa)))
+        path_offset = float(min(0.9, max(-0.9, _lab_po)))
 
     # Soft ROC limit — unconditional, slightly tighter than ford.h, applied before the
     # hardware bypass in ford.h is re-enabled.  Lets us observe whether the limit would
