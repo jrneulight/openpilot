@@ -107,6 +107,12 @@ _DEVIATION_CLIP_GATE_MS = 9.0  # m/s; below this the deviation clip (and stall d
 # fact), so stall detection can extend to the path-offset check's low-speed floor (5 m/s,
 # ford.h FORD_PATH_OFFSET_LIMITS.angle_error_min_speed). On yaw the 9 m/s distrust stands.
 _STALL_GATE_PINION_MS = 5.0
+# Press-release hand-off blip: only when the road is actually straight-ish. The blip's
+# design intent was always "at hand-off, while the car is straight and the command
+# small", but that was never enforced -- on-road, releases mid-curve fired a 300 ms
+# steering release exactly when steering was needed most, producing a press -> blip ->
+# lane-sag -> press cascade (observed: 6 hand-off blips in 22 s at 17-21 mph on curves).
+_PRESS_BLIP_MAX_CURV = 0.003  # ~333 m radius
 
 # BluePilot: measured-delivery compensation for the path_angle actuator, active only with
 # the pinion measurement (the configuration it was measured in). The PSCM's steady-state
@@ -343,7 +349,8 @@ class LateralAngleExt:
       self.press_timer_s += _STEER_DT
     else:
       if (self.press_timer_s >= _PRESS_BLIP_MIN_S and self.stall_blip_cooldown_s <= 0.0
-          and self.stall_blip_frames_left <= 0):
+          and self.stall_blip_frames_left <= 0
+          and abs(float(actuators.curvature)) < _PRESS_BLIP_MAX_CURV):
         self.stall_blip_frames_left = _STALL_BLIP_FRAMES
       self.press_timer_s = 0.0
 
