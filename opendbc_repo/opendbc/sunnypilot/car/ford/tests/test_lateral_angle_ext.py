@@ -333,6 +333,12 @@ class TestAvail0StallGate(unittest.TestCase):
     ext = self._drive_aged(avail=-1)
     self.assertEqual(ext.stall_blip_count, 1)
 
+  def test_avail1_also_suppresses(self):
+    # LaActAvail is a feature matrix; value 1 (LCA/LKA suppressed, LDW available) is
+    # policy-suppressed centering just like 0
+    ext = self._drive_aged(avail=1)
+    self.assertEqual(ext.stall_blip_count, 0)
+
   def test_avail2_unchanged(self):
     ext = self._drive_aged(avail=2)
     self.assertEqual(ext.stall_blip_count, 1)
@@ -354,6 +360,37 @@ class TestAvail0StallGate(unittest.TestCase):
     cs.out.steeringPressed = False
     self._drive(ext, CP, cs, 12)
     self.assertEqual(ext.stall_blip_count, 1)
+
+
+class TestPandaMirrorFrame(unittest.TestCase):
+  """Panda-facing quantities (published shadow, deviation-clip band) use the panda's
+  measurement frame: raw pinion angle through the FIXED CP geometry -- no live angle
+  offset, no roll compensation, no live steer ratio. Control keeps the compensated
+  measurement (get_current_curvature)."""
+
+  def _lp(self):
+    from types import SimpleNamespace
+    return SimpleNamespace(angleOffsetDeg=2.0, roll=0.05)
+
+  def test_mirror_ignores_live_offset_and_roll(self):
+    ext, _ = _pinion_harness(flag=True)
+    cs = _CS(vEgoRaw=15.0, vEgo=15.0, steeringAngleDeg=30.0, yawRate=0.0)
+    base = ext.get_panda_mirror_curvature(cs)
+    ext.lp = self._lp()
+    self.assertAlmostEqual(ext.get_panda_mirror_curvature(cs), base)   # panda frame unmoved
+    self.assertNotAlmostEqual(ext.get_current_curvature(cs), base)     # control frame moved
+
+  def test_pressed_shadow_publishes_mirror(self):
+    ext, CP = _pinion_harness(flag=True)
+    ext.lp = self._lp()
+    cs = _CS(vEgoRaw=15.0, vEgo=15.0, steeringAngleDeg=30.0, yawRate=0.0, steeringPressed=True)
+    ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=0.01), CP)
+    self.assertAlmostEqual(ext.bp_kappa_cmd, ext.get_panda_mirror_curvature(cs))
+
+  def test_yaw_mode_frames_identical(self):
+    ext, _ = _pinion_harness(flag=False)
+    cs = _CS(vEgoRaw=15.0, vEgo=15.0, yawRate=0.75, steeringAngleDeg=30.0)
+    self.assertAlmostEqual(ext.get_panda_mirror_curvature(cs), ext.get_current_curvature(cs))
 
 
 class TestEntryAgilityBandLead(unittest.TestCase):

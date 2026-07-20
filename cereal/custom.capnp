@@ -585,7 +585,7 @@ struct CarStateBP @0xb057204d7deadf3f {
   # Ford PSCM lateral-control status broadcast (Lane_Assist_Data3_FD1)
   struct PscmLatCtl {
     dataAvailable @0 :Bool;
-    laActAvail @1 :UInt8;  # LaActAvail_D_Actl: 2 = lateral control served, 0 = withdrawn by PSCM availability policy
+    laActAvail @1 :UInt8;  # LaActAvail_D_Actl feature matrix: bit1 = LCA/LKA centering available, bit0 = LDW not suppressed; values 0/1 = centering policy-suppressed (Q3: below ~40 km/h)
     laActDeny @2 :Bool;  # LaActDeny_B_Actl
     laHandsOff @3 :Bool;  # LaHandsOff_B_Actl: PSCM hands-off estimate, more sensitive than steeringPressed
     tjaHandsOnConfidence @4 :Bool;  # TjaHandsOnCnfdnc_B_Est

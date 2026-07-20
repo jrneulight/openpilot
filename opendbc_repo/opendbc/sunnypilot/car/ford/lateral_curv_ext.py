@@ -115,6 +115,12 @@ class LateralCurvExt:
     # liveDelay is consumed by LateralAngleExt (variable lookup time); harmless for curvature mode.
     self.sm = messaging.SubMaster(['modelV2', 'liveParameters', 'selfdriveState', 'radarState', 'liveDelay'])
     self.VM = VehicleModel(CP)
+    # BluePilot: frozen copy for the panda-mirror measurement (get_panda_mirror_curvature).
+    # self.VM receives live steerRatio/stiffness from paramsd (update_sm), drifting up to
+    # ~6% from the CP values; ford.h's pinion geometry table is built from the CP values
+    # and never moves. Quantities compared against the panda's own check must be computed
+    # in the panda's frame, so this instance never gets update_params.
+    self.VM_panda = VehicleModel(CP)
     self.model = None
     self.lp = None
     self.ss = None
@@ -238,6 +244,23 @@ class LateralCurvExt:
     # Compatibility shim for LateralAngleExt, which calls this as a lazy-init guard. In this
     # branch LateralCurvExt state is initialized eagerly in __init__, so nothing to do here.
     pass
+
+  def get_panda_mirror_curvature(self, CS):
+    """Measured curvature in the PANDA'S reference frame (OP sign convention).
+
+    ford.h judges the wire command against its OWN measurement: raw pinion angle through
+    the fixed CP geometry (no live angle offset, no roll compensation, no live steer
+    ratio). get_current_curvature answers "how is the car actually turning" for control;
+    THIS answers "what will the panda's check compare against". Measured across two
+    routes, the two frames disagree by up to 0.0006 (p99 0.00047; |angleOffsetDeg| ran
+    to 2.1 deg) before counting live-SR drift -- computing panda-facing quantities (the
+    deviation-clip band center, the published shadow) in the panda's frame removes that
+    entire mismatch class from the safety margin instead of budgeting for it.
+    On yaw measurement the two frames are identical (same raw yawRate/v on both layers).
+    """
+    if self.bp_pinion_curvature_enabled:
+      return -self.VM_panda.calc_curvature(math.radians(CS.out.steeringAngleDeg), CS.out.vEgoRaw, 0.0)
+    return -CS.out.yawRate / max(CS.out.vEgoRaw, 0.1)
 
   def get_current_curvature(self, CS):
     """Measured curvature of the car right now (OP sign convention).

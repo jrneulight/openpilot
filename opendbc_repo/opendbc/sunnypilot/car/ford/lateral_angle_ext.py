@@ -136,11 +136,13 @@ _STALL_GATE_PINION_MS = 5.0
 # attenuated-but-moving stalls): the gated slew cut clipped-off lead 33%/67% in the two
 # bake-off routes' saturation windows and fully freed 22-37% of entry episodes, with quiet-
 # frame band wander bounded by the actual tracking error rather than by the clamp. The
-# clamp keeps worst-case wire deviation at CURVATURE_ERROR + 0.0005 = 0.0025: the panda
-# pinion band is 0.003 and the layers disagree by up to ~0.0003 (python subtracts
-# liveParameters.angleOffsetDeg; the panda cannot), so the 0.001 first guess would have had
-# zero margin. Stall-detector charging stays keyed to the STATIC band
-# (bp_stall_charge_bound), making detector behavior bit-identical by construction.
+# clamp keeps worst-case wire deviation at CURVATURE_ERROR + 0.0005 = 0.0025 against the
+# panda's 0.003 pinion band; the band center is computed in the PANDA'S measurement frame
+# (get_panda_mirror_curvature -- measured cross-frame disagreement ran to 0.0006 before
+# counting live-SR drift, which would have consumed the margin), so the 0.0005 headroom is
+# real rather than shared with layer mismatch. Stall-detector charging stays keyed to the
+# STATIC band (bp_stall_charge_bound), making detector behavior bit-identical by
+# construction.
 _BAND_LEAD_MAX = 0.0005   # 1/m; band-center lead clamp toward the demand
 _BAND_LEAD_SLEW = 0.005   # 1/m/s; full clamp reached after 0.1 s of confirmed turn-in
 # Press-release hand-off blip: only when the road is actually straight-ish. The blip's
@@ -355,7 +357,7 @@ class LateralAngleExt:
       # ford.h's deviation check compares a zero shadow against real measured curvature.
       # (ford.h skips the check while steer_control_enabled is 0, so the value is free to
       # follow the measurement during the inactive period itself.)
-      self.bp_kappa_cmd = self.get_current_curvature(CS)
+      self.bp_kappa_cmd = self.get_panda_mirror_curvature(CS)
       self.band_lead = 0.0
       self.bp_stall_charge_bound = False
       self._meas_last_for_lead = self.bp_kappa_cmd
@@ -399,7 +401,7 @@ class LateralAngleExt:
       # Truthful shadow during the override (mirrors the inactive path -- see the comment
       # there): the driver is steering, so the honest command is the car's actual curvature,
       # and the panda-latched shadow stays current for the re-engage frame.
-      self.bp_kappa_cmd = self.get_current_curvature(CS)
+      self.bp_kappa_cmd = self.get_panda_mirror_curvature(CS)
       self.band_lead = 0.0
       self.bp_stall_charge_bound = False
       self._meas_last_for_lead = self.bp_kappa_cmd
@@ -461,7 +463,7 @@ class LateralAngleExt:
       self.bp_curvature_deviation_limited = False
       self.sim_curvature_last = 0.0
       # Truthful shadow during the blip (see the inactive-path comment).
-      self.bp_kappa_cmd = self.get_current_curvature(CS)
+      self.bp_kappa_cmd = self.get_panda_mirror_curvature(CS)
       self.band_lead = 0.0
       self.bp_stall_charge_bound = False
       self._meas_last_for_lead = self.bp_kappa_cmd
@@ -575,6 +577,11 @@ class LateralAngleExt:
     # here; this brings angle mode's actual steering intent in line with that proven behavior rather
     # than only clipping the value reported to panda (which would make the check a no-op).
     current_curvature = self.get_current_curvature(CS)
+    # Panda-frame measurement for every quantity the ford.h check will judge (the clip
+    # band and the published shadow): see get_panda_mirror_curvature. current_curvature
+    # (offset/roll/live-SR compensated) remains the control truth for the stall
+    # detector's gap and delivery fraction below.
+    panda_meas = self.get_panda_mirror_curvature(CS)
     self.bp_curvature_deviation_limited = False
     # kappa_drive is what steers; kappa_cmd is what the panda's shadow check sees. They
     # were one variable, which coupled two contradictory jobs: the shadow MUST follow
@@ -592,14 +599,14 @@ class LateralAngleExt:
       # Entry agility (see _BAND_LEAD_MAX): the band center leads the measurement while the
       # car is confirmed moving toward the demand; static otherwise, and always on yaw.
       if self.bp_pinion_curvature_enabled:
-        _dmeas = current_curvature - self._meas_last_for_lead
-        _demand_gap = _kappa_cmd_pre_error_clip - current_curvature
+        _dmeas = panda_meas - self._meas_last_for_lead
+        _demand_gap = _kappa_cmd_pre_error_clip - panda_meas
         _lead_target = float(clip(_demand_gap, -_BAND_LEAD_MAX, _BAND_LEAD_MAX)) if _dmeas * _demand_gap > 0.0 else 0.0
         _step = _BAND_LEAD_SLEW * _STEER_DT
         self.band_lead += float(clip(_lead_target - self.band_lead, -_step, _step))
       else:
         self.band_lead = 0.0
-      _band_center = current_curvature + self.band_lead
+      _band_center = panda_meas + self.band_lead
       kappa_cmd = float(clip(kappa_cmd, _band_center - CarControllerParams.CURVATURE_ERROR,
                             _band_center + CarControllerParams.CURVATURE_ERROR))
       # BluePilot: did this clip actually constrain kappa_cmd this frame (deviation from measured,
@@ -608,15 +615,15 @@ class LateralAngleExt:
       # Stall charging must not see the led band: an attenuated-but-still-moving stall keeps
       # the follow-gate open and would starve the detector (bake-off: 30% -> 24% charging
       # duty in the pre-rescue windows). Keyed to the static band, it is bit-identical.
-      _kappa_static = float(clip(_kappa_cmd_pre_error_clip, current_curvature - CarControllerParams.CURVATURE_ERROR,
-                                current_curvature + CarControllerParams.CURVATURE_ERROR))
+      _kappa_static = float(clip(_kappa_cmd_pre_error_clip, panda_meas - CarControllerParams.CURVATURE_ERROR,
+                                panda_meas + CarControllerParams.CURVATURE_ERROR))
       self.bp_stall_charge_bound = bool(abs(_kappa_static - _kappa_cmd_pre_error_clip) > 1e-9)
       kappa_drive = kappa_cmd
       if abs(kappa_drive) > abs(_kappa_cmd_pre_error_clip) and kappa_drive * _kappa_cmd_pre_error_clip >= 0:
         kappa_drive = _kappa_cmd_pre_error_clip  # clip may reduce the drive, never amplify it
     else:
       self.band_lead = 0.0
-    self._meas_last_for_lead = current_curvature
+    self._meas_last_for_lead = panda_meas
 
     lateral_uncertainty = 0.0  # no curvature-limit ladder until angle-mode torque display is defined
 
@@ -697,7 +704,7 @@ class LateralAngleExt:
     # in-drive lateral safety block observed across ~3h of replayed road-test routes was exactly
     # this (driver fighting a sustained curve with the mode still enabled). The honest command
     # during a press is the driver's actual curvature.
-    self.bp_kappa_cmd = self.get_current_curvature(CS) if CS.out.steeringPressed else kappa_cmd
+    self.bp_kappa_cmd = self.get_panda_mirror_curvature(CS) if CS.out.steeringPressed else kappa_cmd
 
     # BluePilot: would the equivalent curvature (kappa_cmd) have been rate-limited by curvature-mode's
     # ROC (apply_std_steer_angle_limits)? kappa_cmd is already error-clipped above (same clip
@@ -724,7 +731,9 @@ class LateralAngleExt:
     _stall_gap = desired_curvature - current_curvature
     # While the PSCM positively broadcasts its availability-policy derate, a pulse only
     # helps if press-type attenuation is plausibly stacked on top (_AVAIL0_RESCUE_WINDOW_S).
-    _rescue_plausible = getattr(CS, 'la_act_avail', -1) != 0 or self.attn_trigger_age_s <= _AVAIL0_RESCUE_WINDOW_S
+    # LaActAvail_D_Actl is a feature matrix (bit1 = LCA/LKA centering available, bit0 = LDW
+    # not suppressed): values 0 AND 1 both mean centering is policy-suppressed.
+    _rescue_plausible = getattr(CS, 'la_act_avail', -1) not in (0, 1) or self.attn_trigger_age_s <= _AVAIL0_RESCUE_WINDOW_S
     _stalled = (not CS.out.steeringPressed and not self.lane_change and v_ego > _stall_gate_ms
                 and _rescue_plausible
                 and abs(_stall_gap) > _stall_gap_min
