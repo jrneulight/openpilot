@@ -93,6 +93,9 @@ class CarStateExt:
     # Latches True once Lane_Assist_Data3_FD1 is seen — the message is non-critical in the
     # parser, so cp.vl would otherwise report zeros on cars that never broadcast it
     self.lane_assist_data3_seen = False
+    # LaActAvail_D_Actl for the control layer (lateral_angle_ext stall gate): -1 = no
+    # broadcast seen. The unseen default must NOT be 0 — 0 is the policy-derate state.
+    self.la_act_avail = -1
 
   def update(self, ret: structs.CarState, ret_sp: structs.CarStateSP, can_parsers: dict[StrEnum, CANParser]):
     """
@@ -353,7 +356,8 @@ class CarStateExt:
       if self.lane_assist_data3_seen:
         lad3 = cp.vl["Lane_Assist_Data3_FD1"]
         pscm_lat_ctl.dataAvailable = True
-        pscm_lat_ctl.laActAvail = int(lad3["LaActAvail_D_Actl"])
+        self.la_act_avail = int(lad3["LaActAvail_D_Actl"])
+        pscm_lat_ctl.laActAvail = self.la_act_avail
         pscm_lat_ctl.laActDeny = bool(lad3["LaActDeny_B_Actl"])
         pscm_lat_ctl.laHandsOff = bool(lad3["LaHandsOff_B_Actl"])
         pscm_lat_ctl.tjaHandsOnConfidence = bool(lad3["TjaHandsOnCnfdnc_B_Est"])

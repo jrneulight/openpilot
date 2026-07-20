@@ -140,6 +140,11 @@ _PRESS_BLIP_MAX_CURV = 0.003  # ~333 m radius
 # end: the 5-9 m/s naive inverse is 2.9x, far too aggressive to apply blindly (the PSCM
 # may cap low-speed authority by design), so the plateau extends down modestly and
 # tapers to a no-op at crawl speeds where there is no data at all; iterate on-road.
+# The low-speed cap is now known to be PSCM policy, not a guess: below ~20-25 mph the
+# PSCM broadcasts LaActAvail_D_Actl = 0 and serves commands in a degraded best-effort
+# regime that open-loop gain cannot compensate (measured 0.41-0.52 delivered at
+# avail=0 even with this table's 1.7-2.2x boost active) -- so do not escalate the low
+# end further; the recoverable part is already recovered.
 # Applies only to the path_angle signal: kappa_cmd, the shadow, the deviation clip, and
 # the stall detector are untouched, and the soft ROC + DBC limits still bound the result.
 # PER-PLATFORM: the response curve is a property of each platform's PSCM/EPAS tune, so
@@ -159,6 +164,19 @@ _DELIVERY_COMP = {
   'FORD_EXPLORER_MK6': ([1.5, 3.0, 4.5, 6.0, 8.0, 9.0, 13.0, 14.5, 16.0, 20.0, 23.5],
                         [1.0, 1.8, 2.2, 2.2, 1.7, 1.30, 1.30, 1.09, 0.98, 0.98, 1.0]),
 }
+# Policy-derate awareness (LaActAvail_D_Actl, CAN 972, via CS.la_act_avail). Below
+# ~20-25 mph the Q3 PSCM broadcasts avail=0 -- its stock lane-centering availability
+# policy, verified as a hard speed cliff across five drives (avail=0 on 100% of
+# 15-22.5 mph frames, 87-92% in the 22.5-25 hysteresis band, 0% above 25). In that
+# regime the delivery deficit IS the policy and a mode-0 pulse cannot restore it
+# (route 27: pulse at falling speed + rising demand changed nothing), while a pulse
+# still cures the press-type attenuation that stacks on top (route 27: rescue 0.6 s
+# after a press release reached 0.96 delivery with avail=0 throughout). A futile pulse
+# costs 300 ms of released steering exactly where authority is scarcest, so while the
+# PSCM positively reports avail=0, only fire when an attenuation trigger -- press,
+# human turn, or an engage edge (engagement sag is pulse-curable) -- is recent enough
+# to plausibly be the cause. No broadcast (la_act_avail = -1) keeps today's behavior.
+_AVAIL0_RESCUE_WINDOW_S = 10.0
 _STALL_BLIP_FRAMES = 6       # mode-0 pulse length (6 frames @ 20 Hz = 300 ms; PSCM acked mode 0 in ~150 ms on-road)
 _STALL_COOLDOWN_S = 2.0      # re-arm delay after a pulse (release ramp + PSCM response time)
 _STALL_MAX_BLIPS = 3         # give up on a stuck episode; devLim telemetry keeps recording the stall
@@ -228,6 +246,8 @@ class LateralAngleExt:
     self.stall_blip_count = 0         # pulses fired this stall episode
     self.angle_stall_blip_active = False
     self.press_timer_s = 0.0          # continuous steeringPressed time, for the hand-off blip
+    self.attn_trigger_age_s = 3600.0  # time since press/human-turn/engage (avail=0 stall gate)
+    self._lat_active_prev = False
 
   def update_angle_params(self, params):
     """Sets per-platform gain defaults and reads user feel-factor params."""
@@ -269,6 +289,16 @@ class LateralAngleExt:
 
     v_ego = float(CS.out.vEgoRaw)
     d_ref = pscm_d_ref_m(v_ego)
+
+    # Attenuation-trigger age for the avail=0 stall gate (see _AVAIL0_RESCUE_WINDOW_S):
+    # presses, human-turn overrides, and (re-)engage edges are the events that can leave
+    # press-type attenuation on the PSCM. Tracked before the early returns so the clock
+    # stays honest through override and inactive frames.
+    if CS.out.steeringPressed or self.angle_human_turn_active or (CC.latActive and not self._lat_active_prev):
+      self.attn_trigger_age_s = 0.0
+    else:
+      self.attn_trigger_age_s = min(self.attn_trigger_age_s + _STEER_DT, 3600.0)
+    self._lat_active_prev = bool(CC.latActive)
 
     curvature_rate = 0.0
     path_offset = 0.0
@@ -622,7 +652,11 @@ class LateralAngleExt:
     _stall_gate_ms = _STALL_GATE_PINION_MS if self.bp_pinion_curvature_enabled else _DEVIATION_CLIP_GATE_MS
     _stall_gap_min = _STALL_GAP_MIN_PINION if self.bp_pinion_curvature_enabled else _STALL_GAP_MIN
     _stall_gap = desired_curvature - current_curvature
+    # While the PSCM positively broadcasts its availability-policy derate, a pulse only
+    # helps if press-type attenuation is plausibly stacked on top (_AVAIL0_RESCUE_WINDOW_S).
+    _rescue_plausible = getattr(CS, 'la_act_avail', -1) != 0 or self.attn_trigger_age_s <= _AVAIL0_RESCUE_WINDOW_S
     _stalled = (not CS.out.steeringPressed and not self.lane_change and v_ego > _stall_gate_ms
+                and _rescue_plausible
                 and abs(_stall_gap) > _stall_gap_min
                 and abs(current_curvature) < _STALL_DELIVERY_FRACTION * abs(desired_curvature))
     if _stalled:

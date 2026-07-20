@@ -83,6 +83,7 @@ class _CS:
   def __init__(self, **kwargs):
     self.out = _CSOut(**kwargs)
     self.lat_ctl_lim_stat = 0
+    self.la_act_avail = -1  # no PSCM availability broadcast unless a test sets one
 
 
 @dataclass
@@ -295,6 +296,64 @@ class TestStallPinionFloor(unittest.TestCase):
     # gap 0.0029 < 1.5x with a real fractional deficit (0.64x): healthy-tracking margin
     ext = self._drive(flag=True, desired=0.008, measured=0.0051, v_ego=6.0)
     self.assertEqual(ext.stall_blip_count, 0)
+
+
+class TestAvail0StallGate(unittest.TestCase):
+  """While the PSCM positively broadcasts its availability-policy derate
+  (LaActAvail_D_Actl == 0, via CS.la_act_avail), the delivery deficit is the policy and
+  a mode-0 pulse cannot restore it -- the stall detector must only fire when a
+  press/human-turn/engage interaction is recent enough for press-type attenuation to
+  plausibly be stacked on top. No broadcast (la_act_avail = -1) and avail=2 keep
+  today's behavior bit-identically."""
+
+  def _stalled_cs(self, avail, v_ego=6.0):
+    cs = _CS(vEgoRaw=v_ego, vEgo=v_ego, yawRate=0.0, steeringAngleDeg=0.0)
+    cs.la_act_avail = avail
+    return cs
+
+  def _drive(self, ext, CP, cs, frames):
+    for _ in range(frames):
+      ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=0.01), CP)
+
+  def _drive_aged(self, avail):
+    # consume the engage-edge trigger, then age past the rescue window before the stall
+    ext, CP = _pinion_harness(flag=True)
+    cs = self._stalled_cs(avail)
+    self._drive(ext, CP, cs, 1)
+    ext.attn_trigger_age_s = 600.0
+    self._drive(ext, CP, cs, 12)
+    return ext
+
+  def test_policy_stall_without_trigger_stays_quiet(self):
+    ext = self._drive_aged(avail=0)
+    self.assertEqual(ext.stall_blip_count, 0)
+    self.assertEqual(ext.stall_blip_hold_s, 0.0)
+
+  def test_no_broadcast_unchanged(self):
+    ext = self._drive_aged(avail=-1)
+    self.assertEqual(ext.stall_blip_count, 1)
+
+  def test_avail2_unchanged(self):
+    ext = self._drive_aged(avail=2)
+    self.assertEqual(ext.stall_blip_count, 1)
+
+  def test_engage_edge_reopens_rescue(self):
+    # engagement sag at avail=0 is pulse-curable: the engage edge zeroes the trigger age
+    ext, CP = _pinion_harness(flag=True)
+    cs = self._stalled_cs(avail=0)
+    self._drive(ext, CP, cs, 12)
+    self.assertEqual(ext.stall_blip_count, 1)
+
+  def test_press_release_reopens_rescue(self):
+    ext, CP = _pinion_harness(flag=True)
+    cs = self._stalled_cs(avail=0)
+    self._drive(ext, CP, cs, 1)
+    ext.attn_trigger_age_s = 600.0
+    cs.out.steeringPressed = True
+    self._drive(ext, CP, cs, 2)
+    cs.out.steeringPressed = False
+    self._drive(ext, CP, cs, 12)
+    self.assertEqual(ext.stall_blip_count, 1)
 
 
 class TestPressReleaseBlip(unittest.TestCase):
