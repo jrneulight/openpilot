@@ -187,6 +187,13 @@ _STALL_MAX_BLIPS = 3         # give up on a stuck episode; devLim telemetry keep
 # the PSCM while the car is straight and the command is small -- a 300 ms lateral gap right at
 # hand-off, imperceptible, instead of a missed curve. The reactive detector above stays as backstop.
 _PRESS_BLIP_MIN_S = 0.5      # press must last this long before its release earns a pulse
+# A release only counts as a hand-off once it has PERSISTED: route-27 100 Hz forensics
+# caught a 50 ms grip fluctuation (invisible at this 20 Hz tick) firing the hand-off
+# pulse mid-drive -- a 300 ms steering release bought by nothing. A regrip inside the
+# debounce window resumes the same press (the PSCM's press attenuation persists straight
+# through a micro-release), and the straightness gate is evaluated at fire time, after
+# the window, so the road can't have curved underneath a stale decision.
+_PRESS_BLIP_DEBOUNCE_S = 0.4
 
 
 def pscm_d_ref_m(v_ego_ms: float) -> float:
@@ -246,6 +253,7 @@ class LateralAngleExt:
     self.stall_blip_count = 0         # pulses fired this stall episode
     self.angle_stall_blip_active = False
     self.press_timer_s = 0.0          # continuous steeringPressed time, for the hand-off blip
+    self.press_release_s = 0.0        # time since release while a press is pending (debounce)
     self.attn_trigger_age_s = 3600.0  # time since press/human-turn/engage (avail=0 stall gate)
     self._lat_active_prev = False
 
@@ -332,6 +340,7 @@ class LateralAngleExt:
       self.stall_blip_count = 0
       self.angle_stall_blip_active = False
       self.press_timer_s = 0.0
+      self.press_release_s = 0.0
       self.precision_type = 1
       return LateralResult(
         apply_curvature=0.0,
@@ -375,6 +384,7 @@ class LateralAngleExt:
       self.stall_blip_count = 0
       self.angle_stall_blip_active = False
       self.press_timer_s = 0.0
+      self.press_release_s = 0.0
       self.precision_type = 1
       return LateralResult(
         apply_curvature=0.0,
@@ -392,12 +402,18 @@ class LateralAngleExt:
     # reactive stall detector below to watch the car miss the next curve first.
     if CS.out.steeringPressed:
       self.press_timer_s += _STEER_DT
-    else:
-      if (self.press_timer_s >= _PRESS_BLIP_MIN_S and self.stall_blip_cooldown_s <= 0.0
-          and self.stall_blip_frames_left <= 0
-          and abs(float(actuators.curvature)) < _PRESS_BLIP_MAX_CURV):
-        self.stall_blip_frames_left = _STALL_BLIP_FRAMES
-      self.press_timer_s = 0.0
+      self.press_release_s = 0.0
+    elif self.press_timer_s > 0.0:
+      # Debounced hand-off (see _PRESS_BLIP_DEBOUNCE_S): the release must persist before it
+      # counts; a regrip inside the window resumes the same press without resetting its timer.
+      self.press_release_s += _STEER_DT
+      if self.press_release_s >= _PRESS_BLIP_DEBOUNCE_S:
+        if (self.press_timer_s >= _PRESS_BLIP_MIN_S and self.stall_blip_cooldown_s <= 0.0
+            and self.stall_blip_frames_left <= 0
+            and abs(float(actuators.curvature)) < _PRESS_BLIP_MAX_CURV):
+          self.stall_blip_frames_left = _STALL_BLIP_FRAMES
+        self.press_timer_s = 0.0
+        self.press_release_s = 0.0
 
     # Stall-blip pulse in progress: hold lateral inactive (mode 0, all-zero signals -- the same
     # wire pattern as the human-turn override, no ford.h involvement) for _STALL_BLIP_FRAMES so the

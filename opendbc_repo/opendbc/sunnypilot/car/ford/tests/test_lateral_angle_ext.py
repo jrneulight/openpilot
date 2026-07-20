@@ -359,15 +359,22 @@ class TestAvail0StallGate(unittest.TestCase):
 class TestPressReleaseBlip(unittest.TestCase):
   # The hand-off blip must fire only on straight-ish roads (its design intent): a
   # mid-curve release must NOT trigger a 300 ms steering drop -- the press -> blip ->
-  # lane-sag -> press cascade observed on-road.
+  # lane-sag -> press cascade observed on-road. And the release must PERSIST for the
+  # debounce window: a 50 ms grip fluctuation (route-27 100 Hz forensics) must neither
+  # fire the pulse nor reset the press timer.
 
-  def _press_then_release(self, curvature):
+  RELEASE_FRAMES = 9  # > _PRESS_BLIP_DEBOUNCE_S (0.4 s) at 20 Hz
+
+  def _drive(self, ext, CP, pressed, frames, curvature):
+    cs = _CS(vEgoRaw=8.0, vEgo=8.0, yawRate=0.0, steeringAngleDeg=0.0, steeringPressed=pressed)
+    for _ in range(frames):
+      ext.update_angle_strategy(_CC(latActive=True), cs, _Actuators(curvature=curvature), CP)
+    return ext
+
+  def _press_then_release(self, curvature, release_frames=RELEASE_FRAMES):
     ext, CP = _pinion_harness(flag=True)
-    cs_pressed = _CS(vEgoRaw=8.0, vEgo=8.0, yawRate=0.0, steeringAngleDeg=0.0, steeringPressed=True)
-    for _ in range(15):  # > _PRESS_BLIP_MIN_S of pressing
-      ext.update_angle_strategy(_CC(latActive=True), cs_pressed, _Actuators(curvature=curvature), CP)
-    cs_free = _CS(vEgoRaw=8.0, vEgo=8.0, yawRate=0.0, steeringAngleDeg=0.0)
-    ext.update_angle_strategy(_CC(latActive=True), cs_free, _Actuators(curvature=curvature), CP)
+    self._drive(ext, CP, pressed=True, frames=15, curvature=curvature)  # > _PRESS_BLIP_MIN_S
+    self._drive(ext, CP, pressed=False, frames=release_frames, curvature=curvature)
     return ext
 
   def test_no_blip_on_mid_curve_release(self):
@@ -377,6 +384,30 @@ class TestPressReleaseBlip(unittest.TestCase):
   def test_blip_on_straight_release(self):
     ext = self._press_then_release(curvature=0.001)  # near-straight
     self.assertGreater(ext.stall_blip_frames_left, 0)
+
+  def test_micro_release_does_not_fire(self):
+    # 0.1 s release (2 frames) is inside the debounce window: no pulse
+    ext = self._press_then_release(curvature=0.001, release_frames=2)
+    self.assertEqual(ext.stall_blip_frames_left, 0)
+
+  def test_micro_release_keeps_press_accumulating(self):
+    # press, 0.1 s fluctuation, regrip: the press timer survives the gap, so the
+    # eventual real hand-off still earns its pulse
+    ext, CP = _pinion_harness(flag=True)
+    self._drive(ext, CP, pressed=True, frames=15, curvature=0.001)
+    self._drive(ext, CP, pressed=False, frames=2, curvature=0.001)   # micro-release
+    self._drive(ext, CP, pressed=True, frames=2, curvature=0.001)    # regrip
+    self.assertGreater(ext.press_timer_s, 0.5)  # not reset by the fluctuation
+    self._drive(ext, CP, pressed=False, frames=self.RELEASE_FRAMES, curvature=0.001)
+    self.assertGreater(ext.stall_blip_frames_left, 0)
+
+  def test_curvature_gate_evaluated_at_fire_time(self):
+    # straight at release, curved by the end of the debounce window -> no pulse
+    ext, CP = _pinion_harness(flag=True)
+    self._drive(ext, CP, pressed=True, frames=15, curvature=0.001)
+    self._drive(ext, CP, pressed=False, frames=4, curvature=0.001)
+    self._drive(ext, CP, pressed=False, frames=5, curvature=0.008)  # curve arrives mid-window
+    self.assertEqual(ext.stall_blip_frames_left, 0)
 
 
 class TestDeliveryCompensation(unittest.TestCase):
