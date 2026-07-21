@@ -442,7 +442,14 @@ class CarStateExt:
     return dat
 
   def update_traffic_signals(self, cp_cam):
-    """Parse traffic sign recognition data for speed limit (CANFD only).
+    """Parse traffic sign recognition data for speed limit.
+
+    The IPMA camera broadcasts the posted limit in Traffic_RecognitnData on both
+    Q4 (CAN FD) and Q3 (CAN) Fords, using the same signals and DBC. The unit
+    (mph/kph) comes from TsrVlUnitMsgTxt_D_Rq within the message itself, so no
+    separate IPMA_Data2 lookup is needed. On trims without TSR the message is
+    absent (registered non-critical) and its signals default to 0/255, which
+    this function maps to "no limit".
 
     Args:
       cp_cam: Camera bus CAN parser
@@ -450,12 +457,8 @@ class CarStateExt:
     Returns:
       Speed limit in m/s, or 0 if not available.
     """
-    if self.CP.flags & FordFlags.CANFD:
-      v_limit = cp_cam.vl["Traffic_RecognitnData"]["TsrVLim1MsgTxt_D_Rq"]
-      v_limit_unit = cp_cam.vl["Traffic_RecognitnData"]["TsrVlUnitMsgTxt_D_Rq"]
+    v_limit = cp_cam.vl["Traffic_RecognitnData"]["TsrVLim1MsgTxt_D_Rq"]
+    v_limit_unit = cp_cam.vl["Traffic_RecognitnData"]["TsrVlUnitMsgTxt_D_Rq"]
 
-      speed_factor = CV.MPH_TO_MS if v_limit_unit == 2 else CV.KPH_TO_MS if v_limit_unit == 1 else 0
-      return v_limit * speed_factor if v_limit not in (0, 255) else 0
-
-    return 0
-
+    speed_factor = CV.MPH_TO_MS if v_limit_unit == 2 else CV.KPH_TO_MS if v_limit_unit == 1 else 0
+    return v_limit * speed_factor if v_limit not in (0, 255) else 0
