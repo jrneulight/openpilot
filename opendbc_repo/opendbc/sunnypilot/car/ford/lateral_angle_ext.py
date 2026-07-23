@@ -32,7 +32,8 @@ from opendbc.sunnypilot.car.ford.human_turn import HumanTurnDetector
 from opendbc.sunnypilot.car.ford.values_ext import BP_ANGLE_LIMITS
 from selfdrive.modeld.constants import ModelConstants
 
-# Hard-coded per-platform gain defaults (not user-tunable).
+# Per-platform gain defaults. The low-curvature value is a fallback when the
+# FordHighSpeedDampening_ang user param is unavailable or invalid.
 # CAN vehicles (Escape MK4, Bronco Sport, Explorer, Maverick, Edge)
 _GAIN_CAN         = (1.00, 1.15)
 # CAN-FD body-on-frame trucks (F-150, Lightning, Expedition, Ranger)
@@ -244,7 +245,8 @@ class LateralAngleExt:
     self.vlt_extra_max = _VLT_T_EXTRA_MAX
     # Telemetry: final path_angle (rad) after limits (see bp_card_publisher)
     self.bp_path_angle_final = 0.0
-    # High-speed gain factors: set per-platform via carFingerprint in update_angle_params.
+    # High-speed gain factors: initialized per-platform in update_angle_params; the
+    # low-curvature value is overridden by FordHighSpeedDampening_ang when available.
     self.path_angle_gain_lowC_highV = 1.0   # dampening at high speed, low curvature
     self.path_angle_gain_highC_highV = 1.0  # gain at high speed, high curvature
     self.bp_path_angle_gain_lowC_highV = 1.0
@@ -292,7 +294,7 @@ class LateralAngleExt:
     self._lat_active_prev = False
 
   def update_angle_params(self, params):
-    """Sets per-platform gain defaults and reads user feel-factor params."""
+    """Sets per-platform gain defaults and reads user angle-tuning params."""
     self._ensure_lateral_curv_initialized(self.CP)
     fp = getattr(self.CP, 'carFingerprint', '')
     if fp in _CANFD_BOF_CARS:
@@ -304,13 +306,16 @@ class LateralAngleExt:
     self.path_angle_gain_lowC_highV = low
     self.path_angle_gain_highC_highV = high
     if params is not None and hasattr(params, "get"):
-      for attr, key in (("low_speed_curv_factor", "FordLowSpeedFactor_ang"),
-                        ("high_speed_curv_factor", "FordHighSpeedFactor_ang")):
+      for attr, key, min_value, max_value in (
+        ("low_speed_curv_factor", "FordLowSpeedFactor_ang", 0.5, 1.5),
+        ("high_speed_curv_factor", "FordHighSpeedFactor_ang", 0.5, 1.5),
+        ("path_angle_gain_lowC_highV", "FordHighSpeedDampening_ang", 0.75, 1.25),
+      ):
         try:
           raw = params.get(key, return_default=True)
           if raw is not None and raw != b"":
             setattr(self, attr, float(clip(
-              float(raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw), 0.5, 1.5)))
+              float(raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw), min_value, max_value)))
         except Exception:
           pass
       try:

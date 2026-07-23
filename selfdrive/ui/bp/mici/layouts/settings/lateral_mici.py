@@ -22,6 +22,9 @@ class LateralLayoutMici(NavScroller):
     self.high_speed_factor = BigParamFloatControl(
       "High Speed Adjustment Factor", "FordHighSpeedFactor_ang", min=0.5, max=1.5, step=0.01,
     )
+    self.high_speed_dampening = BigParamFloatControl(
+      "High Speed Dampening", "FordHighSpeedDampening_ang", min=0.75, max=1.25, step=0.01,
+    )
     self.lane_change_factor_high_ang = BigParamFloatControl(
       "Lane Change Factor High", "lane_change_factor_high_ang", min=0.85, max=1.50,
     )
@@ -69,6 +72,7 @@ class LateralLayoutMici(NavScroller):
     self._scroller.add_widgets([
       self.low_speed_factor,
       self.high_speed_factor,
+      self.high_speed_dampening,
       self.lane_change_factor_high_ang,
       self.disable_lane_change_under_speed,
       self.blinker_min_speed,
@@ -110,6 +114,7 @@ class LateralLayoutMici(NavScroller):
     is_curv = not is_angle
     self.low_speed_factor.set_visible(is_angle)
     self.high_speed_factor.set_visible(is_angle)
+    self.high_speed_dampening.set_visible(is_angle)
     self.lane_change_factor_high_ang.set_visible(is_angle)
     self.blinker_min_speed.set_enabled(ui_state.params.get_bool("BlinkerPauseLaneChange"))
     for item in (

@@ -70,6 +70,14 @@ class _ForcedDetector:
     pass
 
 
+class _FakeParams:
+  def __init__(self, values):
+    self.values = values
+
+  def get(self, key, return_default=False):
+    return self.values.get(key)
+
+
 @dataclass
 class _CSOut:
   vEgoRaw: float = 15.0
@@ -100,6 +108,7 @@ class _Harness(LateralCurvExt, LateralAngleExt):
   """Mirrors CarController's mixin composition (see carcontroller.py)."""
 
   def __init__(self, CP, CP_SP=None):
+    self.CP = CP  # CarControllerBase initializes this before the lateral mixins.
     with mock.patch.object(lateral_curv_ext.messaging, 'SubMaster', _FakeSubMaster):
       LateralCurvExt.__init__(self, CP, CP_SP)
     LateralAngleExt.__init__(self, CP, CP_SP)
@@ -188,6 +197,21 @@ class TestMeasurementSelection(unittest.TestCase):
     expected = -VehicleModel(CP).calc_curvature(math.radians(30.0), self.V_EGO, 0.0)
     self.assertAlmostEqual(ext.get_current_curvature(cs), expected)
     self.assertNotAlmostEqual(ext.get_current_curvature(cs), -0.75 / self.V_EGO)
+
+
+class TestAngleParams(unittest.TestCase):
+  def setUp(self):
+    self.ext = _Harness(_explorer_cp())
+
+  def test_high_speed_dampening_controls_low_curvature_high_speed_gain(self):
+    self.ext.update_angle_params(_FakeParams({"FordHighSpeedDampening_ang": b"1.12"}))
+    self.assertAlmostEqual(self.ext.path_angle_gain_lowC_highV, 1.12)
+
+  def test_high_speed_dampening_is_clamped(self):
+    for raw_value, expected in ((b"0.50", 0.75), (b"1.50", 1.25)):
+      with self.subTest(raw_value=raw_value):
+        self.ext.update_angle_params(_FakeParams({"FordHighSpeedDampening_ang": raw_value}))
+        self.assertAlmostEqual(self.ext.path_angle_gain_lowC_highV, expected)
 
 
 class TestInitializeFord(unittest.TestCase):

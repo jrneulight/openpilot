@@ -532,6 +532,15 @@ class BluePilotLayout(Widget):
       step=0.01,
       icon="chffr_wheel.png"
     )
+    self._high_speed_dampening = float_control_item(
+      lambda: tr("High Speed Dampening"),
+      lambda: tr("High speed dampening is for straightaways at highway speed.  For oversteer reduce it, For understeer increase it. Default: 1.0"),
+      param="FordHighSpeedDampening_ang",
+      min_value=0.75,
+      max_value=1.25,
+      step=0.01,
+      icon="chffr_wheel.png"
+    )
     # Disable BP lateral control toggle
     self._disable_BP_lat = toggle_item(
       lambda: tr("Disable BP Lateral Control"),
@@ -614,6 +623,7 @@ class BluePilotLayout(Widget):
     angle_items = [
       self._low_speed_curv_factor,
       self._high_speed_curv_factor,
+      self._high_speed_dampening,
       self._lane_change_factor_high_ang,
     ]
     angle_header = CollapsibleSectionHeader(tr("Angle Tuning"))
@@ -862,6 +872,7 @@ class BluePilotLayout(Widget):
     # Angle-mode items: always visible (Angle Tuning section), greyed out when curvature mode is active
     self._low_speed_curv_factor.action_item.set_enabled(is_angle)
     self._high_speed_curv_factor.action_item.set_enabled(is_angle)
+    self._high_speed_dampening.action_item.set_enabled(is_angle)
     self._lane_change_factor_high_ang.action_item.set_enabled(is_angle)
     # Curvature-mode items: always visible (Curvature Tuning section), greyed out when angle mode is active
     self._lane_change_factor_high_curv.action_item.set_enabled(is_curv)
