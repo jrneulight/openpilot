@@ -32,8 +32,7 @@ from opendbc.sunnypilot.car.ford.human_turn import HumanTurnDetector
 from opendbc.sunnypilot.car.ford.values_ext import BP_ANGLE_LIMITS
 from selfdrive.modeld.constants import ModelConstants
 
-# Per-platform gain defaults. The low-curvature value is a fallback when the
-# FordHighSpeedDampening_ang user param is unavailable or invalid.
+# Hard-coded per-platform gain defaults.
 # CAN vehicles (Escape MK4, Bronco Sport, Explorer, Maverick, Edge)
 _GAIN_CAN         = (1.00, 1.15)
 # CAN-FD body-on-frame trucks (F-150, Lightning, Expedition, Ranger)
@@ -245,15 +244,15 @@ class LateralAngleExt:
     self.vlt_extra_max = _VLT_T_EXTRA_MAX
     # Telemetry: final path_angle (rad) after limits (see bp_card_publisher)
     self.bp_path_angle_final = 0.0
-    # High-speed gain factors: initialized per-platform in update_angle_params; the
-    # low-curvature value is overridden by FordHighSpeedDampening_ang when available.
+    # High-speed gain factors: set per-platform via carFingerprint in update_angle_params.
     self.path_angle_gain_lowC_highV = 1.0   # dampening at high speed, low curvature
     self.path_angle_gain_highC_highV = 1.0  # gain at high speed, high curvature
     self.bp_path_angle_gain_lowC_highV = 1.0
     self.bp_path_angle_gain_highC_highV = 1.0
-    # User-tunable "feel" multipliers: read from FordLowSpeedFactor_ang / FordHighSpeedFactor_ang params.
+    # User-tunable "feel" multipliers: read from the angle-tuning Params below.
     self.low_speed_curv_factor = 1.0
     self.high_speed_curv_factor = 1.0
+    self.user_dampening_factor = 1.0
     self.bp_low_speed_curv_factor = 1.0
     self.bp_high_speed_curv_factor = 1.0
     # BluePilot: angle mode's own lane-change scaling factor, independent of curvature mode's
@@ -309,7 +308,7 @@ class LateralAngleExt:
       for attr, key, min_value, max_value in (
         ("low_speed_curv_factor", "FordLowSpeedFactor_ang", 0.5, 1.5),
         ("high_speed_curv_factor", "FordHighSpeedFactor_ang", 0.5, 1.5),
-        ("path_angle_gain_lowC_highV", "FordHighSpeedDampening_ang", 0.75, 1.25),
+        ("user_dampening_factor", "FordHighSpeedDampening_ang", 0.75, 1.25),
       ):
         try:
           raw = params.get(key, return_default=True)
@@ -650,7 +649,9 @@ class LateralAngleExt:
 
 
     # Speed-interpolated gain: at low speed both curves use 1.0; at high speed the params take effect.
-    self.low_gain_calc = interp(v_ego, [13.5, 26.82], [1.0, self.path_angle_gain_lowC_highV])
+    self.low_gain_calc = interp(
+      v_ego, [13.5, 26.82], [1.0, (self.path_angle_gain_lowC_highV * self.user_dampening_factor)]
+    )
     self.high_gain_calc = interp(v_ego, [13.5, 26.82], [(1.30 * self.low_speed_curv_factor), (self.path_angle_gain_highC_highV * self.high_speed_curv_factor)])
 
     # As the curve gets bigger, we will need a little boost to the signal to to not understeer
