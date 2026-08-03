@@ -96,6 +96,15 @@ _VLT_KAPPA_STRAIGHT = 0.0006
 # independent cross-check that this is a mapping-shape fix and not an arbitrary detune.
 _SMALLSIG_V_MS   = (13.5, 17.0, 20.0, 23.0, 26.0, 29.4, 34.0)
 _SMALLSIG_FACTOR = (1.000, 1.000, 0.717, 0.573, 0.430, 0.408, 0.338)
+# Platforms this correction is calibrated for. The table above is a per-platform PLANT
+# measurement (delivered curvature per unit path_angle vs speed), not a universal property of
+# the kappa*v mapping, and angle mode is a user-selectable toggle on every Ford here -- so
+# applying Explorer numbers fleet-wide would detune high-speed straight-line gain by up to 3x
+# on cars whose loop gain was never measured. It would also break the curvature_factor knee on
+# the CANFD body-on-frame gains (high_gain_calc 0.95 <= low_gain_calc's stock 1.0 leaves no gain
+# gap for the knee widening to reference, pinning the knee at its 0.005 clamp). Same
+# measured-platforms-only convention as _DELIVERY_COMP above.
+_SMALLSIG_CARS = frozenset({'FORD_EXPLORER_MK6'})
 
 # Rate cap on path_angle magnitude DECREASE during PSCM LimitReached (rad/call = 0.40 rad/s).
 # Both model and planner naturally drop path_angle ~0.36 rad/s at a sharp 90° apex, while the PSCM is
@@ -715,7 +724,11 @@ class LateralAngleExt:
     # Small-signal ONLY: applied to the low-curvature branch. Steady-state curve delivery was
     # measured correct (|meas/plan| 1.00 at 8-14 m/s, 1.12 at 20-26 on |kappa|>0.002 frames), so
     # the high-curvature branch must not be touched or curves would start to understeer.
-    self.bp_highspeed_smallsig_factor = float(interp(v_ego, _SMALLSIG_V_MS, _SMALLSIG_FACTOR))
+    #
+    # Measured platforms only (see _SMALLSIG_CARS): the table is a plant measurement, not a
+    # property of the mapping, so it is not extrapolated to cars that were never measured.
+    self.bp_highspeed_smallsig_factor = (float(interp(v_ego, _SMALLSIG_V_MS, _SMALLSIG_FACTOR))
+                                         if CP.carFingerprint in _SMALLSIG_CARS else 1.0)
     self.low_gain_calc = float(self.low_gain_calc) * self.bp_highspeed_smallsig_factor
     self.high_gain_calc = interp(v_ego, [13.5, 26.82], [(1.30 * self.low_speed_curv_factor), (self.path_angle_gain_highC_highV * self.high_speed_curv_factor)])
 
@@ -728,12 +741,15 @@ class LateralAngleExt:
     # the upper knee in proportion keeps the ramp's slope per unit kappa close to stock, so the
     # handoff to the (unchanged) high-curvature branch stays gradual.
     # Derive the knee from the actual gain gap so the ramp's slope per unit kappa is no steeper
-    # than it would have been without the correction, instead of guessing a width. Scaling the
-    # original 0.0003-wide band by how much the correction widened the gap does this directly,
-    # and stays well-defined when high_gain_calc sits at or below 1.0 (where a "stock slope"
-    # reference would be zero or negative and tell us nothing).
+    # than it would have been without the correction, instead of guessing a width: scale the
+    # original 0.0003-wide band by exactly how much the correction widened the gap. The
+    # reference is the gap this frame would have had with the correction removed -- NOT
+    # (high_gain_calc - 1.0), since the uncorrected low gain is only 1.0 at or below 13.5 m/s
+    # and using 1.0 above that inflates the ratio (and goes degenerate wherever
+    # high_gain_calc <= 1.0, pinning the knee at its clamp).
     _cf_gap = max(float(self.high_gain_calc) - float(self.low_gain_calc), 0.0)
-    _cf_gap_stock = max(float(self.high_gain_calc) - 1.0, 1e-3)
+    _cf_low_gain_uncorrected = float(self.low_gain_calc) / max(self.bp_highspeed_smallsig_factor, 1e-6)
+    _cf_gap_stock = max(float(self.high_gain_calc) - _cf_low_gain_uncorrected, 1e-3)
     _cf_knee_hi = 0.0007 + 0.0003 * max(_cf_gap / _cf_gap_stock, 1.0)
     # keep the knee inside real curve curvature (0.005 1/m = 200 m radius) so curves still reach
     # the unchanged high-curvature gain by the time the curve is a genuine curve

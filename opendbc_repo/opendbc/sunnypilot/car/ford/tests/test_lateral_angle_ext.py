@@ -298,22 +298,45 @@ class TestHighSpeedSmallSignalCorrection(unittest.TestCase):
     expected = ext.path_angle_gain_highC_highV * ext.high_speed_curv_factor
     self.assertAlmostEqual(ext.high_gain_calc, expected)
 
-  def test_curvature_ramp_is_no_steeper_than_the_original_band(self):
+  def test_curvature_ramp_is_no_steeper_than_without_the_correction(self):
     """Pulling low_gain_calc down must not turn the curvature_factor ramp into a cliff:
     a steep ramp near straight-road curvature lets the weave modulate its own gain, which is
-    the very failure this change removes. The upper knee widens in proportion to compensate,
-    so the gain change per unit curvature never exceeds what the original 0.0003-wide band
-    would have produced for the same gain gap."""
+    the very failure this change removes. The upper knee widens in proportion to compensate.
+
+    Compares against the slope the ORIGINAL 0.0003-wide band would have produced for the
+    UNCORRECTED gain gap. (Comparing against `gap / 0.0003` for the corrected gap instead is
+    satisfied by construction -- the knee's 0.001 floor makes the denominator >= 0.0003 always
+    -- so it would assert nothing.)"""
     for v in (20.0, 26.0, 29.4, 34.0):
       with self.subTest(v=v):
         ext = _Harness(_explorer_cp())
+        ext.update_angle_params(None)
         ext.update_angle_strategy(_CC(), _CS(vEgoRaw=v, vEgo=v), _Actuators(), ext.CP)
-        gap = ext.high_gain_calc - ext.low_gain_calc
-        slope = gap / (ext.bp_curvature_factor_knee_hi - 0.0007)
-        self.assertLessEqual(slope, gap / 0.0003 + 1e-6)
-        # and strictly gentler than stock whenever the correction is actually active
-        if ext.bp_highspeed_smallsig_factor < 1.0:
-          self.assertGreater(ext.bp_curvature_factor_knee_hi, 0.001)
+        self.assertLess(ext.bp_highspeed_smallsig_factor, 1.0)  # correction is active here
+        slope = (ext.high_gain_calc - ext.low_gain_calc) / (ext.bp_curvature_factor_knee_hi - 0.0007)
+        low_gain_uncorrected = ext.low_gain_calc / ext.bp_highspeed_smallsig_factor
+        slope_uncorrected = (ext.high_gain_calc - low_gain_uncorrected) / 0.0003
+        self.assertLessEqual(slope, slope_uncorrected + 1e-6)
+        self.assertGreater(ext.bp_curvature_factor_knee_hi, 0.001)
+
+  def test_only_applied_to_measured_platforms(self):
+    """The factor table is a per-platform plant measurement (delivered curvature per unit
+    path_angle vs speed), not a property of the kappa*v mapping, and angle mode is selectable on
+    every Ford. Extrapolating Explorer numbers fleet-wide would detune unmeasured cars by ~3x,
+    and on the CANFD body-on-frame gains it also degenerates the knee (high_gain_calc 0.95 is
+    below the uncorrected low_gain_calc, leaving no gap to scale, so the knee pins at its clamp)."""
+    for fp in (CAR.FORD_F_150_MK14, CAR.FORD_F_150_LIGHTNING_MK1, CAR.FORD_EXPEDITION_MK4,
+               CAR.FORD_RANGER_MK2, CAR.FORD_MUSTANG_MACH_E_MK1, CAR.FORD_ESCAPE_MK4_5):
+      for v in (26.0, 34.0):
+        with self.subTest(car=str(fp), v=v):  # str(): xdist cannot serialize the enum in a subTest
+          CP = _explorer_cp()
+          CP.carFingerprint = fp
+          ext = _Harness(CP)
+          ext.update_angle_params(None)
+          ext.update_angle_strategy(_CC(), _CS(vEgoRaw=v, vEgo=v), _Actuators(), CP)
+          self.assertEqual(ext.bp_highspeed_smallsig_factor, 1.0)
+          # and the knee stays at its original value, so their ramp is bit-identical to stock
+          self.assertAlmostEqual(ext.bp_curvature_factor_knee_hi, 0.001)
 
   def test_widened_knee_stays_inside_real_curve_curvature(self):
     """The knee must not run off to arbitrarily large curvature, or curves would never reach
