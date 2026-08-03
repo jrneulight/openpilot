@@ -75,6 +75,27 @@ _VLT_V_LOW_MS   = 25.0 * 0.44704    # 25 mph — full extra lookahead at or belo
 _VLT_V_HIGH_MS  = 55.0 * 0.44704    # 55 mph — no extra lookahead at or above this speed
 _VLT_KAPPA_FULL  = 0.005             # 1/m — full extra lookahead below this curvature (200m+ radius)
 _VLT_KAPPA_TAPER = 0.020             # 1/m — no extra lookahead above this curvature (50m radius)
+# Straight-road t_base ceiling. The 0.15 s cap at the t_base site exists to protect the
+# deep-curve apex (see the comment there); on a genuinely straight road there is no apex to
+# protect, and that cap is what leaves the learned plant delay uncompensated. Bounded well
+# below the ~0.52 s that liveDelay has been observed to learn, so a bad estimate cannot push
+# the lookahead arbitrarily far ahead.
+_VLT_T_BASE_STRAIGHT_MAX = 0.30
+# 1/m — "straight enough" that no apex protection is needed. Set just under the curvature_factor
+# knee (0.0007) so the relaxed ceiling applies exactly in the small-signal regime where the
+# weave lives; measured straight-road weave frames sit at |kappa| < 0.0006.
+_VLT_KAPPA_STRAIGHT = 0.0006
+
+# Small-signal high-speed loop-gain correction (see use site in update_angle_strategy).
+# Solved from the measured straight-road loop gain (meas kappa / planner kappa at the weave
+# frequency, hands-off, engaged, |kappa| < 0.0006) for a 0.80x target, i.e. factor = 0.80/gain:
+#   17 m/s -> 0.93x (already stable, no correction)   26 -> 1.86x   29.4 -> 1.96x   34 -> 2.37x
+# Held flat above 34 m/s (the fastest speed with data) rather than extrapolated. Unity at and
+# below 17 m/s, so city and low-speed behaviour is bit-identical. The implied effective lookahead
+# length (factor * v) stays in a physical 11-14 m band across the whole range, which is the
+# independent cross-check that this is a mapping-shape fix and not an arbitrary detune.
+_SMALLSIG_V_MS   = (13.5, 17.0, 20.0, 23.0, 26.0, 29.4, 34.0)
+_SMALLSIG_FACTOR = (1.000, 1.000, 0.717, 0.573, 0.430, 0.408, 0.338)
 
 # Rate cap on path_angle magnitude DECREASE during PSCM LimitReached (rad/call = 0.40 rad/s).
 # Both model and planner naturally drop path_angle ~0.36 rad/s at a sharp 90° apex, while the PSCM is
@@ -253,6 +274,9 @@ class LateralAngleExt:
     self.low_speed_curv_factor = 1.0
     self.high_speed_curv_factor = 1.0
     self.user_dampening_factor = 1.0
+    # Telemetry: small-signal high-speed loop-gain correction applied this frame
+    self.bp_highspeed_smallsig_factor = 1.0
+    self.bp_curvature_factor_knee_hi = 0.001  # upper knee of the curvature_factor ramp
     self.bp_low_speed_curv_factor = 1.0
     self.bp_high_speed_curv_factor = 1.0
     # BluePilot: angle mode's own lane-change scaling factor, independent of curvature mode's
@@ -512,13 +536,34 @@ class LateralAngleExt:
     # curvature, kappa_entering stays True, and the exit-biased blend is permanently disabled — causing the car
     # to command max path_angle through the entire apex. 0.15s gives t_base ≤ 0.20s and VLT ≤ 0.33s, restoring
     # the 2.8m lookahead that kept kappa_entering False at the apex in successful earlier runs.
-    _t_base = float(clip(self.sm['liveDelay'].lateralDelay, 0.1, 0.15)) + _DT_MDL
+    # That 0.15 cap protects the apex, but on a straight road there is no apex and the cap is
+    # what starves phase lead: measured highway straights learn ~0.52 s of plant delay while
+    # the controller compensates only 0.20 s, leaving ~0.32 s (~-21 deg at the 0.18 Hz weave).
+    # With the PSCM's small-signal gain rising as the command shrinks, that missing lead is
+    # what sustains a broadband loop gain of ~1.9 above 24 m/s on straights. So admit more of
+    # the learned delay, but ONLY while the road is straight now AND stays straight across the
+    # whole extended horizon -- the deep-curve case above keeps its original 0.15 s ceiling.
+    _curvatures_ref = None
+    if self.model is not None and len(self.model.orientationRate.z) >= 17:
+      _curvatures_ref = np.array(self.model.orientationRate.z) / max(0.01, v_ego)
+    _t_base_max = 0.15
+    if abs(desired_curvature) < _VLT_KAPPA_STRAIGHT:
+      # probe the model out to the furthest lookahead the relaxed ceiling could produce, so a
+      # curve entering the horizon keeps us on the conservative cap instead of oscillating between them
+      _probe_t = _VLT_T_BASE_STRAIGHT_MAX + _DT_MDL + self.vlt_extra_max
+      _kappa_ahead = 0.0
+      if _curvatures_ref is not None:
+        _t_probe = [t for t in ModelConstants.T_IDXS if t <= _probe_t]
+        if _t_probe:
+          _kappa_ahead = float(np.max(np.abs(_curvatures_ref[:len(_t_probe)])))
+      if _kappa_ahead < _VLT_KAPPA_STRAIGHT:
+        _t_base_max = _VLT_T_BASE_STRAIGHT_MAX
+    _t_base = float(clip(self.sm['liveDelay'].lateralDelay, 0.1, _t_base_max)) + _DT_MDL
     _speed_factor = float(interp(v_ego, [_VLT_V_LOW_MS, _VLT_V_HIGH_MS], [1.0, 0.0]))
     # Direction-aware kappa factor: on curve ENTRY (model shows more curvature at t_base than planner now),
     # keep full lookahead so pre-steering begins early. On exit/apex, taper by magnitude to prevent unwind.
     _kappa_at_t_base = 0.0
-    if self.model is not None and len(self.model.orientationRate.z) >= 17:
-      _curvatures_ref = np.array(self.model.orientationRate.z) / max(0.01, v_ego)
+    if _curvatures_ref is not None:
       _kappa_at_t_base = abs(float(interp(_t_base, ModelConstants.T_IDXS, _curvatures_ref)))
     _kappa_entering = _kappa_at_t_base > abs(desired_curvature)
     if _kappa_entering:
@@ -652,10 +697,50 @@ class LateralAngleExt:
     self.low_gain_calc = interp(
       v_ego, [13.5, 26.82], [1.0, (self.path_angle_gain_lowC_highV * self.user_dampening_factor)]
     )
+    # Small-signal high-speed loop-gain correction (straight-road weave).
+    #
+    # `path_angle = kappa * v * cf` makes the command per unit curvature grow linearly with v,
+    # but the PSCM's delivered curvature per unit command does NOT fall as 1/v -- measured on
+    # settled hands-off highway frames it is roughly flat (0.063 kappa/rad at 17 m/s, 0.081 at
+    # 26, 0.085 at 34). So closed-loop gain tracks v: measured 0.93x at 17 m/s (stable) but
+    # 1.86x at 26, 1.96x at 29.4 and 2.37x at 34 -- above 1.0, which is why the weave sustains
+    # and grows instead of decaying. The rise is driven by SPEED, not command amplitude: at
+    # matched command amplitude (rms ~0.0028 rad) gain still goes 0.93x -> 2.37x from 17 to 34.
+    #
+    # Correcting it means holding the effective lookahead LENGTH roughly constant instead of
+    # letting it grow as v, which is also what the PSCM's own sub-linear d_ref geometry implies
+    # (the module docstring's `path_angle = 0.5*kappa*d_ref`). Anchored at 17 m/s, the measured
+    # stable point, so nothing at or below highway-onramp speed changes.
+    #
+    # Small-signal ONLY: applied to the low-curvature branch. Steady-state curve delivery was
+    # measured correct (|meas/plan| 1.00 at 8-14 m/s, 1.12 at 20-26 on |kappa|>0.002 frames), so
+    # the high-curvature branch must not be touched or curves would start to understeer.
+    self.bp_highspeed_smallsig_factor = float(interp(v_ego, _SMALLSIG_V_MS, _SMALLSIG_FACTOR))
+    self.low_gain_calc = float(self.low_gain_calc) * self.bp_highspeed_smallsig_factor
     self.high_gain_calc = interp(v_ego, [13.5, 26.82], [(1.30 * self.low_speed_curv_factor), (self.path_angle_gain_highC_highV * self.high_speed_curv_factor)])
 
-    # As the curve gets bigger, we will need a little boost to the signal to to not understeer
-    self.curvature_factor = interp(abs(kappa_drive), [0.0007, 0.001], [self.low_gain_calc, self.high_gain_calc])
+    # As the curve gets bigger, we will need a little boost to the signal to to not understeer.
+    # The upper knee widens with the small-signal correction: with low_gain_calc pulled down to
+    # ~0.34 at 34 m/s, ramping to high_gain_calc over the original 0.0007..0.001 band would be a
+    # 3.4x gain change across kappa a gentle highway sweeper crosses (that band is occupied ~2%
+    # of highway frames, and 0.0007 sits inside straight-road noise). A steep ramp there lets the
+    # weave modulate its own gain -- the failure this whole change exists to remove. Stretching
+    # the upper knee in proportion keeps the ramp's slope per unit kappa close to stock, so the
+    # handoff to the (unchanged) high-curvature branch stays gradual.
+    # Derive the knee from the actual gain gap so the ramp's slope per unit kappa is no steeper
+    # than it would have been without the correction, instead of guessing a width. Scaling the
+    # original 0.0003-wide band by how much the correction widened the gap does this directly,
+    # and stays well-defined when high_gain_calc sits at or below 1.0 (where a "stock slope"
+    # reference would be zero or negative and tell us nothing).
+    _cf_gap = max(float(self.high_gain_calc) - float(self.low_gain_calc), 0.0)
+    _cf_gap_stock = max(float(self.high_gain_calc) - 1.0, 1e-3)
+    _cf_knee_hi = 0.0007 + 0.0003 * max(_cf_gap / _cf_gap_stock, 1.0)
+    # keep the knee inside real curve curvature (0.005 1/m = 200 m radius) so curves still reach
+    # the unchanged high-curvature gain by the time the curve is a genuine curve
+    _cf_knee_hi = float(clip(_cf_knee_hi, 0.001, 0.005))
+    self.bp_curvature_factor_knee_hi = _cf_knee_hi  # telemetry / regression tests
+    self.curvature_factor = interp(abs(kappa_drive), [0.0007, _cf_knee_hi],
+                                   [self.low_gain_calc, self.high_gain_calc])
 
     path_angle_calc = kappa_drive * v_ego * self.curvature_factor
     # measured-delivery compensation (see _DELIVERY_COMP above); pinion-measured platforms

@@ -59,6 +59,27 @@ class _FakeSubMaster:
     raise KeyError(key)
 
 
+class _FakeOrientationRate:
+  def __init__(self, z):
+    self.z = z
+
+
+class _FakeModelMeta:
+  laneChangeState = 0
+
+
+class _FakeModel:
+  """Minimal modelV2 stand-in: the code reads orientationRate.z and meta.laneChangeState."""
+  def __init__(self, z):
+    self.orientationRate = _FakeOrientationRate(z)
+    self.meta = _FakeModelMeta()
+
+
+def _model_with_curvature(kappa, v, n=33):
+  """A model predicting constant curvature `kappa` across the whole horizon."""
+  return _FakeModel([kappa * v] * n)
+
+
 class _ForcedDetector:
   def __init__(self, active):
     self.active = active
@@ -215,16 +236,126 @@ class TestAngleParams(unittest.TestCase):
     self.ext.update_angle_params(_FakeParams({"FordHighSpeedDampening_ang": b"1.12"}))
     cs = _CS(vEgoRaw=26.82, vEgo=26.82)
     self.ext.update_angle_strategy(_CC(), cs, _Actuators(), self.ext.CP)
+    # the user knob multiplies through, on top of the small-signal high-speed correction
     self.assertAlmostEqual(
       self.ext.low_gain_calc,
-      self.ext.path_angle_gain_lowC_highV * self.ext.user_dampening_factor,
+      self.ext.path_angle_gain_lowC_highV * self.ext.user_dampening_factor
+      * self.ext.bp_highspeed_smallsig_factor,
     )
+
+  def test_high_speed_dampening_still_scales_the_gain(self):
+    """The knob must remain monotonic in the delivered low-curvature gain."""
+    gains = []
+    for raw in (b"0.75", b"1.25"):
+      ext = _Harness(_explorer_cp())
+      ext.update_angle_params(_FakeParams({"FordHighSpeedDampening_ang": raw}))
+      cs = _CS(vEgoRaw=26.82, vEgo=26.82)
+      ext.update_angle_strategy(_CC(), cs, _Actuators(), ext.CP)
+      gains.append(ext.low_gain_calc)
+    self.assertLess(gains[0], gains[1])
 
   def test_high_speed_dampening_is_clamped(self):
     for raw_value, expected in ((b"0.50", 0.75), (b"1.50", 1.25)):
       with self.subTest(raw_value=raw_value):
         self.ext.update_angle_params(_FakeParams({"FordHighSpeedDampening_ang": raw_value}))
         self.assertAlmostEqual(self.ext.user_dampening_factor, expected)
+
+
+class TestHighSpeedSmallSignalCorrection(unittest.TestCase):
+  """Straight-road highway weave: measured loop gain was 0.93x at 17 m/s but 1.86-2.37x at
+  26-34 m/s, so the small-signal command must shrink with speed rather than grow as kappa*v."""
+
+  def _factor_at(self, v):
+    ext = _Harness(_explorer_cp())
+    ext.update_angle_strategy(_CC(), _CS(vEgoRaw=v, vEgo=v), _Actuators(), ext.CP)
+    return ext.bp_highspeed_smallsig_factor
+
+  def test_unity_at_and_below_the_stable_anchor(self):
+    # 17 m/s measured 0.93x (stable) -- nothing at or below it may change
+    for v in (5.0, 13.5, 17.0):
+      with self.subTest(v=v):
+        self.assertAlmostEqual(self._factor_at(v), 1.0)
+
+  def test_monotonically_reduces_with_speed(self):
+    factors = [self._factor_at(v) for v in (17.0, 20.0, 23.0, 26.0, 29.4, 34.0)]
+    self.assertEqual(factors, sorted(factors, reverse=True))
+    self.assertLess(factors[-1], 0.5)
+
+  def test_brings_measured_loop_gain_below_unity(self):
+    """The whole point: measured gain x correction must land under 1.0 with margin."""
+    for v, measured_gain in ((26.0, 1.86), (29.4, 1.96), (34.0, 2.37)):
+      with self.subTest(v=v):
+        self.assertLess(measured_gain * self._factor_at(v), 1.0)
+
+  def test_held_flat_above_the_fastest_measured_speed(self):
+    # no extrapolation beyond 34 m/s, the fastest speed with data
+    self.assertAlmostEqual(self._factor_at(40.0), self._factor_at(34.0))
+
+  def test_does_not_touch_the_high_curvature_branch(self):
+    """Steady-state curve delivery measured correct, so curve gain must be unchanged."""
+    ext = _Harness(_explorer_cp())
+    ext.update_angle_strategy(_CC(), _CS(vEgoRaw=29.4, vEgo=29.4), _Actuators(), ext.CP)
+    expected = ext.path_angle_gain_highC_highV * ext.high_speed_curv_factor
+    self.assertAlmostEqual(ext.high_gain_calc, expected)
+
+  def test_curvature_ramp_is_no_steeper_than_the_original_band(self):
+    """Pulling low_gain_calc down must not turn the curvature_factor ramp into a cliff:
+    a steep ramp near straight-road curvature lets the weave modulate its own gain, which is
+    the very failure this change removes. The upper knee widens in proportion to compensate,
+    so the gain change per unit curvature never exceeds what the original 0.0003-wide band
+    would have produced for the same gain gap."""
+    for v in (20.0, 26.0, 29.4, 34.0):
+      with self.subTest(v=v):
+        ext = _Harness(_explorer_cp())
+        ext.update_angle_strategy(_CC(), _CS(vEgoRaw=v, vEgo=v), _Actuators(), ext.CP)
+        gap = ext.high_gain_calc - ext.low_gain_calc
+        slope = gap / (ext.bp_curvature_factor_knee_hi - 0.0007)
+        self.assertLessEqual(slope, gap / 0.0003 + 1e-6)
+        # and strictly gentler than stock whenever the correction is actually active
+        if ext.bp_highspeed_smallsig_factor < 1.0:
+          self.assertGreater(ext.bp_curvature_factor_knee_hi, 0.001)
+
+  def test_widened_knee_stays_inside_real_curve_curvature(self):
+    """The knee must not run off to arbitrarily large curvature, or curves would never reach
+    the unchanged high-curvature gain. 0.005 1/m is a 200 m radius -- unambiguously a curve.
+
+    (The gain schedule's input is the deviation-clipped kappa_drive, which cannot exceed
+    measured + CURVATURE_ERROR in any one frame, so this bounds the knee rather than asserting
+    a single-frame ramp completion.)"""
+    for v in (26.0, 34.0):
+      with self.subTest(v=v):
+        ext = _Harness(_explorer_cp())
+        ext.update_angle_strategy(_CC(), _CS(vEgoRaw=v, vEgo=v),
+                                  _Actuators(curvature=0.006), ext.CP)
+        self.assertLessEqual(ext.bp_curvature_factor_knee_hi, 0.005)
+        # the ramp is monotonic toward high_gain_calc: more curvature never means less gain
+        self.assertGreater(ext.curvature_factor, ext.low_gain_calc)
+        self.assertLessEqual(ext.curvature_factor, ext.high_gain_calc)
+
+
+class TestStraightRoadLookahead(unittest.TestCase):
+  """The 0.15 s liveDelay cap protects the deep-curve apex; on a straight road it only
+  starves phase lead. _FakeLiveDelay learns 0.2 s, above the conservative cap."""
+
+  def _lookahead(self, curvature, model_kappa):
+    ext = _Harness(_explorer_cp())
+    ext.model = _model_with_curvature(model_kappa, v=29.4)
+    ext.update_angle_strategy(_CC(), _CS(vEgoRaw=29.4, vEgo=29.4),
+                              _Actuators(curvature=curvature), ext.CP)
+    return ext.bp_curvature_lookup_time
+
+  def test_straight_road_admits_more_of_the_learned_delay(self):
+    straight = self._lookahead(0.0, 0.0)
+    curve = self._lookahead(0.01, 0.01)
+    self.assertGreater(straight, curve)
+
+  def test_curve_keeps_the_conservative_cap(self):
+    # apex protection intact: capped at 0.15 + DT_MDL, extra term is 0 above 24.6 m/s
+    self.assertAlmostEqual(self._lookahead(0.01, 0.01), 0.15 + 0.05)
+
+  def test_curve_entering_the_horizon_keeps_the_conservative_cap(self):
+    """Planner still reads straight, but a curve is visible ahead -- must not relax."""
+    self.assertAlmostEqual(self._lookahead(0.0, 0.01), 0.15 + 0.05)
 
 
 class TestInitializeFord(unittest.TestCase):
